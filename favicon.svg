@@ -1,0 +1,17 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" role="img" aria-label="Slate">
+  <defs>
+    <linearGradient id="tile" x1="0" y1="0" x2="1" y2="1" gradientUnits="objectBoundingBox">
+      <stop offset="0" stop-color="#1a1c21" />
+      <stop offset="1" stop-color="#090a0c" />
+    </linearGradient>
+    <linearGradient id="gloss" x1="0" y1="0" x2="0" y2="1" gradientUnits="objectBoundingBox">
+      <stop offset="0" stop-color="#ffffff" stop-opacity=".1" />
+      <stop offset="1" stop-color="#ffffff" stop-opacity="0" />
+    </linearGradient>
+  </defs>
+  <rect width="512" height="512" rx="115" fill="url(#tile)" />
+  <rect x="20" y="18" width="472" height="256" rx="97" fill="url(#gloss)" />
+  <rect x="1.5" y="1.5" width="509" height="509" rx="113.5" fill="none" stroke="#ffffff" stroke-opacity=".12" stroke-width="3" />
+  <path d="M172 260 230 318 344 196" fill="none" stroke="#f6f6f2" stroke-width="42" stroke-linecap="round" stroke-linejoin="round" />
+  <circle cx="350" cy="352" r="17" fill="#8b91ff" />
+</svg>

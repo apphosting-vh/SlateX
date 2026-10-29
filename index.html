@@ -1,0 +1,293 @@
+<!doctype html>
+<html lang="en" class="h-full">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+  <title>Slate — Tasks & Notes</title>
+  <meta name="description" content="A quiet, offline-first home for your tasks and notes. Private by design, stored on your device." />
+
+  <link rel="manifest" href="./manifest.json" />
+  <link rel="icon" href="./favicon.svg" type="image/svg+xml" />
+  <link rel="icon" href="./icons/icon-192.png" sizes="192x192" type="image/png" />
+  <link rel="apple-touch-icon" href="./icons/apple-touch-icon.png" />
+  <link rel="preconnect" href="https://cdn.jsdelivr.net" crossorigin />
+  <link rel="dns-prefetch" href="https://cdn.tailwindcss.com" />
+
+  <meta id="theme-color" name="theme-color" content="#f7f7f5" />
+  <meta name="color-scheme" content="light dark" />
+  <meta name="application-name" content="Slate" />
+  <meta name="apple-mobile-web-app-capable" content="yes" />
+  <meta name="apple-mobile-web-app-title" content="Slate" />
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
+  <meta name="mobile-web-app-capable" content="yes" />
+  <meta name="msapplication-TileColor" content="#0a0b0d" />
+  <meta name="msapplication-TileImage" content="./icons/icon-192.png" />
+
+  <!-- Apply the saved theme before first paint to avoid a flash. -->
+  <script>
+    (function () {
+      var theme = 'system';
+      try {
+        var prefs = JSON.parse(localStorage.getItem('slate:prefs:v1') || '{}');
+        if (prefs && (prefs.theme === 'light' || prefs.theme === 'dark' || prefs.theme === 'system')) theme = prefs.theme;
+      } catch (e) { /* ignore corrupt preferences */ }
+      var dark = theme === 'dark' || (theme === 'system' && window.matchMedia('(prefers-color-scheme: dark)').matches);
+      document.documentElement.classList.toggle('dark', dark);
+      document.documentElement.style.colorScheme = dark ? 'dark' : 'light';
+      var themeColor = document.getElementById('theme-color');
+      if (themeColor) themeColor.setAttribute('content', dark ? '#0a0b0d' : '#f7f7f5');
+      window.__SLATE_THEME__ = theme;
+    })();
+  </script>
+
+  <script src="https://cdn.tailwindcss.com/3.4.16"></script>
+  <script>
+    tailwind.config = {
+      darkMode: 'class',
+      theme: {
+        extend: {
+          colors: {
+            app: 'rgb(var(--app) / <alpha-value>)',
+            panel: 'rgb(var(--panel) / <alpha-value>)',
+            raised: 'rgb(var(--raised) / <alpha-value>)',
+            line: 'rgb(var(--line) / <alpha-value>)',
+            ink: 'rgb(var(--ink) / <alpha-value>)',
+            muted: 'rgb(var(--muted) / <alpha-value>)',
+            accent: 'rgb(var(--accent) / <alpha-value>)'
+          },
+          fontFamily: {
+            sans: ['Calibri', '"Segoe UI Variable Text"', '"Segoe UI"', 'Inter', '-apple-system', 'BlinkMacSystemFont', 'system-ui', 'sans-serif'],
+            mono: ['"Cascadia Code"', '"SF Mono"', 'Consolas', 'monospace']
+          },
+          boxShadow: {
+            soft: '0 1px 2px rgb(0 0 0 / 0.04), 0 8px 24px -16px rgb(0 0 0 / 0.25)',
+            pop: '0 16px 40px -12px rgb(0 0 0 / 0.28), 0 0 0 1px rgb(var(--line) / 0.08)'
+          },
+          keyframes: {
+            'fade-in': { from: { opacity: '0' }, to: { opacity: '1' } },
+            'fade-up': { from: { opacity: '0', transform: 'translateY(6px)' }, to: { opacity: '1', transform: 'translateY(0)' } },
+            'pop-in': { from: { opacity: '0', transform: 'translateY(-4px) scale(.98)' }, to: { opacity: '1', transform: 'translateY(0) scale(1)' } },
+            'toast-in': { from: { opacity: '0', transform: 'translateY(10px) scale(.98)' }, to: { opacity: '1', transform: 'translateY(0) scale(1)' } },
+            'check-in': { from: { opacity: '0', transform: 'scale(.4)' }, to: { opacity: '1', transform: 'scale(1)' } },
+            'bar': { from: { transform: 'scaleX(0)' }, to: { transform: 'scaleX(1)' } }
+          },
+          animation: {
+            'fade-in': 'fade-in .2s ease-out both',
+            'fade-up': 'fade-up .25s cubic-bezier(.2,.7,.3,1) both',
+            'pop-in': 'pop-in .14s ease-out both',
+            'toast-in': 'toast-in .2s cubic-bezier(.2,.7,.3,1) both',
+            'check-in': 'check-in .18s cubic-bezier(.2,.7,.3,1) both'
+          }
+        }
+      }
+    };
+  </script>
+
+  <style>
+    :root {
+      --app: 247 247 245;
+      --panel: 255 255 255;
+      --raised: 250 250 248;
+      --line: 22 23 26;
+      --ink: 24 25 28;
+      --muted: 113 116 122;
+      --accent: 79 70 229;
+    }
+    .dark {
+      --app: 10 11 13;
+      --panel: 17 18 21;
+      --raised: 23 24 28;
+      --line: 255 255 255;
+      --ink: 235 235 232;
+      --muted: 143 145 151;
+      --accent: 139 145 255;
+    }
+
+    html, body, #root { height: 100%; }
+    body {
+      background-color: rgb(var(--app));
+      color: rgb(var(--ink));
+      font-family: Calibri, "Segoe UI Variable Text", "Segoe UI", Inter, -apple-system, BlinkMacSystemFont, system-ui, sans-serif;
+      font-size: 17.6px;
+      overscroll-behavior: none;
+      font-feature-settings: "cv11", "ss01";
+      text-rendering: optimizeLegibility;
+    }
+    * { -webkit-tap-highlight-color: transparent; }
+    ::selection { background: rgb(var(--accent) / 0.22); }
+
+    button, input, textarea, select { font: inherit; }
+    input, textarea { color: inherit; }
+    input::placeholder, textarea::placeholder { color: rgb(var(--muted) / 0.75); }
+    textarea { field-sizing: content; }
+
+    :focus-visible {
+      outline: 2px solid rgb(var(--accent) / 0.55);
+      outline-offset: 2px;
+    }
+    input:focus-visible, textarea:focus-visible { outline: none; }
+
+    .scroll-thin { scrollbar-width: thin; scrollbar-color: rgb(var(--line) / 0.16) transparent; }
+    .scroll-thin::-webkit-scrollbar { width: 11px; height: 11px; }
+    .scroll-thin::-webkit-scrollbar-track { background: transparent; }
+    .scroll-thin::-webkit-scrollbar-thumb {
+      background: rgb(var(--line) / 0.16);
+      border: 3px solid transparent;
+      background-clip: content-box;
+      border-radius: 999px;
+    }
+    .scroll-thin::-webkit-scrollbar-thumb:hover { background: rgb(var(--line) / 0.3); background-clip: content-box; }
+    .scroll-thin::-webkit-scrollbar-corner { background: transparent; }
+
+    .no-scrollbar { scrollbar-width: none; }
+    .no-scrollbar::-webkit-scrollbar { display: none; }
+
+    /* Invisible native date picker layered over the due-date chip. */
+    .date-overlay::-webkit-calendar-picker-indicator {
+      position: absolute; inset: 0; width: 100%; height: 100%;
+      margin: 0; padding: 0; cursor: pointer;
+    }
+
+    /* Markdown preview */
+    .md { font-size: 15.95px; line-height: 1.75; color: rgb(var(--ink) / 0.92); overflow-wrap: anywhere; }
+    .md > :first-child { margin-top: 0; }
+    .md > :last-child { margin-bottom: 0; }
+    .md h1, .md h2, .md h3, .md h4, .md h5, .md h6 {
+      color: rgb(var(--ink)); font-weight: 600; line-height: 1.3;
+      letter-spacing: -0.015em; margin: 1.7em 0 0.6em;
+    }
+    .md h1 { font-size: 1.55em; }
+    .md h2 { font-size: 1.3em; }
+    .md h3 { font-size: 1.12em; }
+    .md h4, .md h5, .md h6 { font-size: 1em; }
+    .md p { margin: 0.85em 0; }
+    .md a { color: rgb(var(--accent)); text-decoration: underline; text-underline-offset: 2px; text-decoration-thickness: 1px; text-decoration-color: rgb(var(--accent) / 0.35); }
+    .md a:hover { text-decoration-color: rgb(var(--accent)); }
+    .md strong { font-weight: 650; color: rgb(var(--ink)); }
+    .md em { font-style: italic; }
+    .md del { opacity: 0.6; }
+    .md code {
+      font-family: "Cascadia Code", "SF Mono", Consolas, monospace;
+      font-size: 0.87em; padding: 0.16em 0.38em; border-radius: 5px;
+      background: rgb(var(--line) / 0.07); border: 1px solid rgb(var(--line) / 0.06);
+    }
+    .md pre {
+      margin: 1.1em 0; padding: 14px 16px; overflow-x: auto; border-radius: 10px;
+      background: rgb(var(--line) / 0.045); border: 1px solid rgb(var(--line) / 0.07);
+      line-height: 1.6;
+    }
+    .md pre code { background: none; border: none; padding: 0; font-size: 0.86em; }
+    .md ul, .md ol { margin: 0.8em 0; padding-left: 1.5em; }
+    .md ul { list-style: disc; }
+    .md ol { list-style: decimal; }
+    .md li { margin: 0.32em 0; padding-left: 0.15em; }
+    .md li::marker { color: rgb(var(--muted) / 0.7); }
+    .md ul.task-list { list-style: none; padding-left: 0.1em; }
+    .md ul.task-list li { display: flex; gap: 0.55em; align-items: flex-start; }
+    .md .md-check {
+      flex: none; width: 15px; height: 15px; margin-top: 0.32em; border-radius: 4px;
+      border: 1.5px solid rgb(var(--line) / 0.28); display: inline-flex; align-items: center;
+      justify-content: center; font-size: 11px; line-height: 1; color: transparent;
+    }
+    .md .md-check.done { background: rgb(var(--accent)); border-color: rgb(var(--accent)); color: rgb(var(--panel)); }
+    .md blockquote {
+      margin: 1.1em 0; padding: 0.15em 0 0.15em 1em;
+      border-left: 2px solid rgb(var(--line) / 0.16); color: rgb(var(--muted));
+    }
+    .md blockquote p { margin: 0.45em 0; }
+    .md hr { margin: 1.9em 0; border: 0; border-top: 1px solid rgb(var(--line) / 0.1); }
+    .md img { max-width: 100%; border-radius: 8px; }
+    .md table { border-collapse: collapse; margin: 1em 0; width: 100%; font-size: 0.94em; }
+    .md th, .md td { border: 1px solid rgb(var(--line) / 0.1); padding: 6px 10px; text-align: left; }
+    .md th { background: rgb(var(--line) / 0.035); font-weight: 600; }
+
+    /* Rich text editor: same typography as preview, with editing affordances. */
+    .rich-editor { min-height: 46vh; outline: none; cursor: text; }
+    .rich-editor > :first-child { margin-top: 0; }
+    .rich-editor > :last-child { margin-bottom: 0; }
+    .rich-editor pre { white-space: pre-wrap; overflow-x: visible; }
+    .rich-editor a { cursor: text; }
+    .rich-editor ul.task-list { list-style: none; padding-left: 0.1em; }
+    .rich-editor ul.task-list li { display: flex; gap: 0.55em; align-items: flex-start; }
+    .rich-editor input[type="checkbox"] {
+      flex: none; width: 15px; height: 15px; margin: 0.36em 0 0;
+      accent-color: rgb(var(--accent)); cursor: pointer;
+    }
+    .rich-editor li:empty::after,
+    .rich-editor p:empty::after { content: "\200b"; }
+
+    @media (prefers-reduced-motion: reduce) {
+      *, *::before, *::after {
+        animation-duration: 0.001ms !important;
+        animation-iteration-count: 1 !important;
+        transition-duration: 0.001ms !important;
+        scroll-behavior: auto !important;
+      }
+    }
+
+    /* Boot screen */
+    #boot {
+      height: 100%; display: flex; flex-direction: column; align-items: center; justify-content: center;
+      gap: 0; background: rgb(var(--app)); color: rgb(var(--ink)); padding: 24px; text-align: center;
+    }
+    .boot-mark {
+      width: 44px; height: 44px; border-radius: 13px; background: rgb(var(--ink)); color: rgb(var(--panel));
+      display: grid; place-items: center; margin-bottom: 18px;
+    }
+    .boot-title { font-size: 18.7px; font-weight: 600; letter-spacing: -0.02em; }
+    .boot-sub { margin-top: 5px; font-size: 12.1px; letter-spacing: 0.16em; text-transform: uppercase; color: rgb(var(--muted)); }
+    .boot-track { margin-top: 26px; width: 120px; height: 2px; border-radius: 99px; background: rgb(var(--line) / 0.09); overflow: hidden; }
+    .boot-track span { display: block; height: 100%; width: 40%; border-radius: 99px; background: rgb(var(--ink) / 0.45); animation: boot-slide 1.1s ease-in-out infinite; }
+    @keyframes boot-slide { 0% { transform: translateX(-110%); } 100% { transform: translateX(320%); } }
+    .boot-error { max-width: 420px; display: none; }
+    .boot-error h1 { font-size: 16.5px; font-weight: 600; margin-bottom: 8px; }
+    .boot-error p { font-size: 14.3px; line-height: 1.6; color: rgb(var(--muted)); margin-bottom: 16px; }
+    .boot-error button {
+      border: 1px solid rgb(var(--line) / 0.16); background: rgb(var(--panel)); color: rgb(var(--ink));
+      padding: 7px 14px; border-radius: 8px; font-size: 13.75px; cursor: pointer;
+    }
+    .boot-error button:hover { background: rgb(var(--raised)); }
+  </style>
+</head>
+<body class="h-full overflow-hidden bg-app font-sans antialiased">
+  <div id="root">
+    <div id="boot">
+      <div class="boot-mark" aria-hidden="true">
+        <svg width="24" height="24" viewBox="0 0 24 24" fill="none">
+          <path d="M6.5 12.4 10 15.9 17.6 8.3" stroke="currentColor" stroke-width="2.1" stroke-linecap="round" stroke-linejoin="round" />
+        </svg>
+      </div>
+      <div class="boot-title">Slate</div>
+      <div class="boot-sub">Tasks &amp; Notes</div>
+      <div class="boot-track" aria-hidden="true"><span></span></div>
+      <div class="boot-error" role="alert">
+        <h1>Slate couldn't start</h1>
+        <p>The app files or one of the CDN dependencies could not be loaded. If this is the first launch, check your connection. After the first visit, Slate runs fully offline.</p>
+        <button type="button" onclick="location.reload()">Try again</button>
+      </div>
+    </div>
+  </div>
+
+  <noscript>
+    <div style="position:fixed;inset:0;display:grid;place-items:center;background:rgb(var(--app));color:rgb(var(--ink));padding:24px;text-align:center;font-size:15.4px">
+      Slate needs JavaScript enabled to run.
+    </div>
+  </noscript>
+
+  <script src="https://cdn.jsdelivr.net/npm/react@18.3.1/umd/react.production.min.js" crossorigin="anonymous"></script>
+  <script src="https://cdn.jsdelivr.net/npm/react-dom@18.3.1/umd/react-dom.production.min.js" crossorigin="anonymous"></script>
+  <script src="https://cdn.jsdelivr.net/npm/@babel/standalone@7.26.4/babel.min.js" crossorigin="anonymous"></script>
+  <script>
+    // Friendly failure state if a CDN is unreachable on first run.
+    setTimeout(function () {
+      var boot = document.getElementById('boot');
+      if (!boot || window.__SLATE_BOOTED__) return;
+      var err = boot.querySelector('.boot-error');
+      var track = boot.querySelector('.boot-track');
+      if (err) err.style.display = 'block';
+      if (track) track.style.display = 'none';
+    }, 15000);
+  </script>
+  <script type="text/babel" data-presets="react" src="./app-core.js"></script>
+</body>
+</html>
