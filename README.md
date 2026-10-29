@@ -1,0 +1,2 @@
+# SlateX
+Note Taking App
