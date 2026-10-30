@@ -1,7 +1,7 @@
 /* Slate service worker — offline-first app shell + runtime caching.
  * Bump CACHE_VERSION with every release so clients pick up new assets.
  */
-const CACHE_VERSION = 'slate-v1.2.0';
+const CACHE_VERSION = 'slate-v1.7.0';
 const SHELL_CACHE = `${CACHE_VERSION}-shell`;
 const RUNTIME_CACHE = `${CACHE_VERSION}-runtime`;
 
@@ -48,8 +48,25 @@ self.addEventListener('install', (event) => {
     await Promise.all(APP_SHELL.map(async (assetUrl) => {
       try {
         const response = await fetch(new Request(assetUrl, { cache: 'reload' }));
-        if (response.ok) await shell.put(assetUrl, response);
-        else console.warn('[slate/sw] Shell asset responded', response.status, assetUrl);
+        if (response.ok) {
+          await shell.put(assetUrl, response.clone());
+          // Updates only reach clients when this file's bytes change, so a
+          // release that bumps APP_VERSION but forgets CACHE_VERSION would
+          // never install. Say so loudly instead of failing silently.
+          if (assetUrl.endsWith('app-core.js')) {
+            const source = await response.text();
+            const match = /APP_VERSION\s*=\s*'([^']+)'/.exec(source);
+            const appVersion = match && match[1];
+            // Compare the release number, ignoring any prerelease suffix.
+            const cacheVersion = CACHE_VERSION.replace(/^slate-v/, '').split('-')[0];
+            if (appVersion && appVersion !== cacheVersion) {
+              console.warn(
+                `[slate/sw] CACHE_VERSION (${CACHE_VERSION}) does not match app-core.js v${appVersion}. `
+                + 'Bump CACHE_VERSION so installed apps can pick up this release.'
+              );
+            }
+          }
+        } else console.warn('[slate/sw] Shell asset responded', response.status, assetUrl);
       } catch (err) {
         console.warn('[slate/sw] Could not precache', assetUrl, err);
       }

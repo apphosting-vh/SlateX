@@ -14,8 +14,8 @@
 
   const { useState, useEffect, useLayoutEffect, useMemo, useRef, useCallback } = React;
 
-  const APP_VERSION = '1.2.0';
-  const SCHEMA_VERSION = 2;
+  const APP_VERSION = '1.7.1';
+  const SCHEMA_VERSION = 3;
   const PREFS_KEY = 'slate:prefs:v1';
   const FALLBACK_PREFIX = 'slate:data:v1:';
 
@@ -107,20 +107,32 @@
 
   const noteTitle = (note) => (note && note.title && note.title.trim()) || 'Untitled note';
 
+  // ![alt](target) never belongs in a sentence — show the alt text instead.
+  const stripImageMarkdown = (text, replacement = ' ') => (
+    String(text || '').replace(/!\[([^\]\n]*)\]\([^)\n]*\)/g, replacement)
+  );
+
+  const imageCount = (text) => (String(text || '').match(/!\[/g) || []).length;
+
   const noteExcerpt = (note) => {
     if (!note || !note.body) return 'Empty note';
-    const text = note.body
+    const text = String(note.body)
+      .replace(/!\[([^\]\n]*)\]\([^)\n]*\)/g, '$1 ')
       .replace(/```[\s\S]*?```/g, ' ')
       .replace(/[#>*_`~\[\]()!|-]/g, ' ')
       .replace(/\s+/g, ' ')
       .trim();
-    return text ? text.slice(0, 100) : 'Empty note';
+    if (text) return text.slice(0, 100);
+    const images = imageCount(note.body);
+    return images ? `${images} ${images === 1 ? 'image' : 'images'}` : 'Empty note';
   };
 
   const wordCount = (text) => {
-    const trimmed = String(text || '').trim();
-    return trimmed ? trimmed.split(/\s+/).length : 0;
+    const cleaned = stripImageMarkdown(text).trim();
+    return cleaned ? cleaned.split(/\s+/).length : 0;
   };
+
+  const searchableText = (note) => `${note ? note.title : ''}\n${stripImageMarkdown(note ? note.body : '', '$1')}`;
 
   const downloadFile = (filename, content, type) => {
     const blob = new Blob([content], { type: type || 'application/octet-stream' });
@@ -145,7 +157,19 @@
   const noteToMarkdown = (note, options = {}) => {
     const includeFrontmatter = options.frontmatter !== false;
     const title = (note.title || '').trim();
-    const body = String(note.body || '').replace(/\s+$/, '');
+    let body = String(note.body || '').replace(/\s+$/, '');
+    const attachmentPaths = options.attachmentPaths;
+
+    // Folder mirrors point at real files (`../attachments/slate-x.png`) while
+    // the note inside Slate keeps its `attachment://` reference.
+    if (attachmentPaths && attachmentPaths.size) {
+      body = body.replace(/!\[([^\]\n]*)\]\(([^)\n]*)\)/g, (match, alt, target) => {
+        if (!isAttachmentRef(target)) return match;
+        const path = attachmentPaths.get(attachmentIdFromRef(target));
+        return path ? `![${alt}](${path})` : match;
+      });
+    }
+
     const lines = [];
 
     if (includeFrontmatter) {
@@ -221,6 +245,7 @@
     if (!source) return '';
     const codes = [];
     const links = [];
+    const images = [];
     const escaped = [];
 
     // Backslash escapes let the editor round-trip literal Markdown characters.
@@ -232,6 +257,12 @@
     text = text.replace(/`([^`]+)`/g, (match, code) => {
       codes.push(code);
       return `\u0000${codes.length - 1}\u0000`;
+    });
+
+    // Images before links: ![alt](url) would otherwise be read as a link.
+    text = text.replace(/!\[([^\]\n]*)\]\(([^)\s]+)(?:\s+["'][^"']*["'])?\)/g, (match, alt, url) => {
+      images.push({ alt, url });
+      return `\u0003${images.length - 1}\u0003`;
     });
 
     text = text.replace(/\[([^\]\n]+)\]\(([^)\s]+)(?:\s+["'][^"']*["'])?\)/g, (match, label, url) => {
@@ -255,6 +286,25 @@
       const label = escapeHtml(link.label);
       if (!href) return label;
       return `<a href="${escapeHtml(href)}" target="_blank" rel="noopener noreferrer">${label}</a>`;
+    });
+
+    text = text.replace(/\u0003(\d+)\u0003/g, (match, index) => {
+      const image = images[Number(index)];
+      if (!image) return '';
+      const alt = String(image.alt || '').replace(/[\r\n[\]]+/g, ' ').replace(/\s+/g, ' ').trim().slice(0, 200);
+      const altAttr = alt ? ` alt="${escapeHtml(alt)}"` : '';
+      const attachmentId = isAttachmentRef(image.url) ? attachmentIdFromRef(image.url) : '';
+
+      if (attachmentId) {
+        // Keep the reference even when the bytes are missing so the note never
+        // silently drops an image it can no longer load.
+        const src = safeImageSrc(image.url) || missingImagePlaceholder();
+        return `<img src="${escapeHtml(src)}"${altAttr} data-attachment="${escapeHtml(attachmentId)}">`;
+      }
+
+      const src = safeImageSrc(image.url);
+      if (!src) return alt ? escapeHtml(alt) : '';
+      return `<img src="${escapeHtml(src)}"${altAttr}>`;
     });
 
     text = text.replace(/\u0000(\d+)\u0000/g, (match, index) => {
@@ -415,6 +465,19 @@
     const tag = node.tagName;
     if (tag === 'BR') return '\n';
     if (tag === 'INPUT') return '';
+
+    if (tag === 'IMG') {
+      const alt = String(node.getAttribute('alt') || '')
+        .replace(/[[\]\r\n]+/g, ' ')
+        .replace(/\s+/g, ' ')
+        .trim()
+        .slice(0, 200);
+      const attachmentId = node.getAttribute('data-attachment');
+      if (attachmentId) return `![${alt}](${attachmentRef(attachmentId)})`;
+      const src = safeImageSrc(node.getAttribute('src'));
+      if (!src) return alt;
+      return `![${alt}](${src})`;
+    }
 
     const children = Array.from(node.childNodes).map((child) => inlineToMarkdown(child, root)).join('');
 
@@ -630,7 +693,7 @@
   const PASTE_TAGS = new Set([
     'P', 'DIV', 'BR', 'STRONG', 'B', 'EM', 'I', 'DEL', 'S', 'STRIKE',
     'CODE', 'PRE', 'H1', 'H2', 'H3', 'H4', 'H5', 'H6',
-    'UL', 'OL', 'LI', 'BLOCKQUOTE', 'HR', 'A'
+    'UL', 'OL', 'LI', 'BLOCKQUOTE', 'HR', 'A', 'IMG'
   ]);
 
   const PASTE_DROP_TAGS = new Set([
@@ -662,6 +725,26 @@
           clean(parent);
           return;
         }
+
+        if (child.tagName === 'IMG') {
+          // Keep only images Slate can resolve: its own attachments, https, or
+          // a data URL. Everything else (file paths, javascript:) is dropped.
+          const attachmentId = child.getAttribute('data-attachment') || '';
+          const known = attachmentId && attachmentUrl(attachmentId) ? attachmentUrl(attachmentId) : '';
+          const src = known || safeImageSrc(child.getAttribute('src'));
+          if (!src && !attachmentId) {
+            child.remove();
+            return;
+          }
+          const alt = String(child.getAttribute('alt') || '').replace(/[\r\n]+/g, ' ').trim().slice(0, 200);
+          Array.from(child.attributes).forEach((attribute) => child.removeAttribute(attribute.name));
+          if (src) child.setAttribute('src', src);
+          if (alt) child.setAttribute('alt', alt);
+          // The reference always survives, even while its bytes are missing.
+          if (attachmentId) child.setAttribute('data-attachment', attachmentId);
+          return;
+        }
+
         Array.from(child.attributes).forEach((attribute) => {
           if (child.tagName === 'A' && attribute.name === 'href') {
             const href = safeHref(attribute.value);
@@ -687,20 +770,20 @@
     high: {
       label: 'High',
       dot: 'bg-rose-500',
-      chip: 'border-rose-500/20 bg-rose-500/10 text-rose-600 dark:text-rose-300',
-      text: 'text-rose-600 dark:text-rose-300'
+      chip: 'border-rose-500/20 bg-rose-500/10 text-rose-700 dark:text-rose-300',
+      text: 'text-rose-700 dark:text-rose-300'
     },
     medium: {
       label: 'Medium',
       dot: 'bg-amber-500',
-      chip: 'border-amber-500/20 bg-amber-500/10 text-amber-700 dark:text-amber-300',
-      text: 'text-amber-700 dark:text-amber-300'
+      chip: 'border-amber-500/20 bg-amber-500/10 text-amber-800 dark:text-amber-300',
+      text: 'text-amber-800 dark:text-amber-300'
     },
     low: {
       label: 'Low',
       dot: 'bg-sky-500',
-      chip: 'border-sky-500/20 bg-sky-500/10 text-sky-600 dark:text-sky-300',
-      text: 'text-sky-600 dark:text-sky-300'
+      chip: 'border-sky-500/20 bg-sky-500/10 text-sky-700 dark:text-sky-300',
+      text: 'text-sky-700 dark:text-sky-300'
     },
     none: {
       label: 'No priority',
@@ -711,6 +794,69 @@
   };
 
   const PRIORITY_ORDER = { high: 0, medium: 1, low: 2, none: 3 };
+
+  /* Navigation hues. Notebooks, view tabs and filters borrow these so the
+   * chrome stays vibrant while the note surface itself stays calm. Every
+   * class name is written out in full so Tailwind can see it. */
+  const TONES = {
+    violet: {
+      text: 'text-c1', dot: 'bg-c1', bar: 'bg-c1', ring: 'ring-c1/20',
+      tint: 'bg-c1/[0.08]', tintStrong: 'bg-c1/[0.13]',
+      chip: 'border-c1/25 bg-c1/10 text-c1',
+      active: 'bg-c1/[0.11] text-c1 ring-1 ring-c1/20 shadow-sm'
+    },
+    sky: {
+      text: 'text-c2', dot: 'bg-c2', bar: 'bg-c2', ring: 'ring-c2/20',
+      tint: 'bg-c2/[0.08]', tintStrong: 'bg-c2/[0.13]',
+      chip: 'border-c2/25 bg-c2/10 text-c2',
+      active: 'bg-c2/[0.11] text-c2 ring-1 ring-c2/20 shadow-sm'
+    },
+    emerald: {
+      text: 'text-c3', dot: 'bg-c3', bar: 'bg-c3', ring: 'ring-c3/20',
+      tint: 'bg-c3/[0.08]', tintStrong: 'bg-c3/[0.13]',
+      chip: 'border-c3/25 bg-c3/10 text-c3',
+      active: 'bg-c3/[0.11] text-c3 ring-1 ring-c3/20 shadow-sm'
+    },
+    amber: {
+      text: 'text-c4', dot: 'bg-c4', bar: 'bg-c4', ring: 'ring-c4/20',
+      tint: 'bg-c4/[0.08]', tintStrong: 'bg-c4/[0.13]',
+      chip: 'border-c4/25 bg-c4/10 text-c4',
+      active: 'bg-c4/[0.11] text-c4 ring-1 ring-c4/20 shadow-sm'
+    },
+    rose: {
+      text: 'text-c5', dot: 'bg-c5', bar: 'bg-c5', ring: 'ring-c5/20',
+      tint: 'bg-c5/[0.08]', tintStrong: 'bg-c5/[0.13]',
+      chip: 'border-c5/25 bg-c5/10 text-c5',
+      active: 'bg-c5/[0.11] text-c5 ring-1 ring-c5/20 shadow-sm'
+    },
+    fuchsia: {
+      text: 'text-c6', dot: 'bg-c6', bar: 'bg-c6', ring: 'ring-c6/20',
+      tint: 'bg-c6/[0.08]', tintStrong: 'bg-c6/[0.13]',
+      chip: 'border-c6/25 bg-c6/10 text-c6',
+      active: 'bg-c6/[0.11] text-c6 ring-1 ring-c6/20 shadow-sm'
+    },
+    orange: {
+      text: 'text-c7', dot: 'bg-c7', bar: 'bg-c7', ring: 'ring-c7/20',
+      tint: 'bg-c7/[0.08]', tintStrong: 'bg-c7/[0.13]',
+      chip: 'border-c7/25 bg-c7/10 text-c7',
+      active: 'bg-c7/[0.11] text-c7 ring-1 ring-c7/20 shadow-sm'
+    },
+    teal: {
+      text: 'text-c8', dot: 'bg-c8', bar: 'bg-c8', ring: 'ring-c8/20',
+      tint: 'bg-c8/[0.08]', tintStrong: 'bg-c8/[0.13]',
+      chip: 'border-c8/25 bg-c8/10 text-c8',
+      active: 'bg-c8/[0.11] text-c8 ring-1 ring-c8/20 shadow-sm'
+    }
+  };
+  const TONE_ORDER = ['violet', 'sky', 'emerald', 'amber', 'rose', 'fuchsia', 'orange', 'teal'];
+  const tone = (key) => TONES[key] || TONES.violet;
+  // Stable per-notebook colour: the same notebook keeps its hue across reloads.
+  const toneForId = (id) => {
+    const text = String(id || '');
+    let hash = 0;
+    for (let i = 0; i < text.length; i += 1) hash = (hash * 31 + text.charCodeAt(i)) >>> 0;
+    return TONES[TONE_ORDER[hash % TONE_ORDER.length]];
+  };
 
   const normalizeNote = (raw) => {
     if (!raw || typeof raw !== 'object') return null;
@@ -824,9 +970,9 @@
 
   const DB = (() => {
     const DB_NAME = 'slate-db';
-    const DB_VERSION = 1;
-    const ROW_STORES = ['notes', 'tasks'];
-    const STORES = ['notes', 'tasks', 'kv'];
+    const DB_VERSION = 2;
+    const ROW_STORES = ['notes', 'tasks', 'attachments'];
+    const STORES = ['notes', 'tasks', 'attachments', 'kv'];
 
     let dbPromise = null;
     let mode = 'idb';
@@ -879,6 +1025,9 @@
           }
           if (!database.objectStoreNames.contains('kv')) {
             database.createObjectStore('kv');
+          }
+          if (!database.objectStoreNames.contains('attachments')) {
+            database.createObjectStore('attachments', { keyPath: 'id' });
           }
         };
 
@@ -1035,6 +1184,21 @@
         return idbPut(store, value);
       },
 
+      async get(store, key) {
+        assertRowStore(store);
+        if (mode === 'local') {
+          const rows = localRows(store);
+          return rows.find((row) => row.id === key) || null;
+        }
+        const database = await open();
+        return new Promise((resolve, reject) => {
+          const tx = database.transaction(store, 'readonly');
+          const request = tx.objectStore(store).get(key);
+          request.onsuccess = () => resolve(request.result || null);
+          request.onerror = () => reject(request.error || new Error('Read failed'));
+        });
+      },
+
       async putMany(store, values) {
         assertRowStore(store);
         if (!values || !values.length) return;
@@ -1098,6 +1262,269 @@
   })();
 
   /* --------------------------------------------------------------------------
+   * Attachments — images referenced from note bodies as ![alt](attachment://id).
+   * Bytes live in IndexedDB (localStorage rows keep a data URL instead) while a
+   * small in-memory map of URLs keeps rendering synchronous, so Markdown stays
+   * the single source of truth for storage, search, export and sync.
+   * ------------------------------------------------------------------------*/
+
+  const ATTACHMENT_CACHE = new Map(); // id -> { url, type, name, size }
+  const ATTACHMENT_REF = 'attachment://';
+
+  const isAttachmentRef = (value) => String(value || '').startsWith(ATTACHMENT_REF);
+  const attachmentRef = (id) => `${ATTACHMENT_REF}${id}`;
+  const attachmentIdFromRef = (value) => String(value || '').slice(ATTACHMENT_REF.length).trim().split(/\s+/)[0];
+  const attachmentUrl = (id) => (ATTACHMENT_CACHE.has(id) ? ATTACHMENT_CACHE.get(id).url : '');
+
+  const IMAGE_EXT = {
+    'image/png': 'png',
+    'image/jpeg': 'jpg',
+    'image/jpg': 'jpg',
+    'image/gif': 'gif',
+    'image/webp': 'webp',
+    'image/avif': 'avif',
+    'image/svg+xml': 'svg',
+    'image/bmp': 'bmp'
+  };
+
+  const attachmentFileName = (id, type) => `slate-${id}.${IMAGE_EXT[String(type || '').toLowerCase()] || 'png'}`;
+
+  const safeImageSrc = (value) => {
+    const src = String(value || '').trim();
+    if (isAttachmentRef(src)) return attachmentUrl(attachmentIdFromRef(src));
+    if (/^https?:\/\//i.test(src)) return src;
+    if (/^data:image\/[a-z0-9.+-]+(?:;[^,]*)?,/i.test(src)) return src;
+    return '';
+  };
+
+  // Shown where an image reference survives but its bytes cannot be found
+  // (for example a backup restored without attachments). The reference itself
+  // is kept, so the picture returns the moment its data comes back.
+  const missingImagePlaceholder = () => {
+    const svg = '<svg xmlns="http://www.w3.org/2000/svg" width="340" height="120">'
+      + '<rect x="1" y="1" width="338" height="118" rx="10" fill="rgba(128,128,128,0.07)" '
+      + 'stroke="rgba(128,128,128,0.55)" stroke-dasharray="7 6"/>'
+      + '<text x="170" y="66" text-anchor="middle" font-family="Calibri, Segoe UI, sans-serif" '
+      + 'font-size="15" fill="rgba(128,128,128,0.95)">Image not available yet</text></svg>';
+    return `data:image/svg+xml;utf8,${encodeURIComponent(svg)}`;
+  };
+
+  const collectAttachmentIds = (body, out = new Set()) => {
+    const pattern = /!\[[^\]\n]*\]\(attachment:\/\/([^)\s]+)\)/g;
+    const text = String(body || '');
+    let match = pattern.exec(text);
+    while (match) {
+      out.add(match[1]);
+      match = pattern.exec(text);
+    }
+    return out;
+  };
+
+  const revokeAttachment = (id) => {
+    const entry = ATTACHMENT_CACHE.get(id);
+    if (!entry) return;
+    if (entry.url.startsWith('blob:')) {
+      try { URL.revokeObjectURL(entry.url); } catch (err) { /* noop */ }
+    }
+    ATTACHMENT_CACHE.delete(id);
+  };
+
+  const cacheAttachment = (row) => {
+    if (!row || !row.id) return '';
+    revokeAttachment(row.id);
+    let url = '';
+    if (row.blob && typeof URL.createObjectURL === 'function') {
+      url = URL.createObjectURL(row.blob);
+    } else if (row.data) {
+      url = row.data;
+    }
+    if (url) {
+      ATTACHMENT_CACHE.set(row.id, {
+        url,
+        type: row.type || 'image/png',
+        name: row.name || 'image',
+        size: row.size || 0
+      });
+    }
+    return url;
+  };
+
+  const loadAttachments = async () => {
+    let rows = [];
+    try {
+      rows = await DB.getAll('attachments');
+    } catch (err) {
+      rows = [];
+    }
+    (Array.isArray(rows) ? rows : []).forEach(cacheAttachment);
+    return rows;
+  };
+
+  const clearAttachmentCache = () => {
+    Array.from(ATTACHMENT_CACHE.keys()).forEach(revokeAttachment);
+  };
+
+  const blobToDataUrl = (blob) => new Promise((resolve) => {
+    try {
+      const reader = new FileReader();
+      reader.onload = () => resolve(String(reader.result || ''));
+      reader.onerror = () => resolve('');
+      reader.readAsDataURL(blob);
+    } catch (err) {
+      resolve('');
+    }
+  });
+
+  const dataUrlToBlob = (dataUrl) => {
+    try {
+      const comma = String(dataUrl || '').indexOf(',');
+      if (comma < 0) return null;
+      const header = String(dataUrl).slice(0, comma);
+      const typeMatch = /^data:([^;]+)/.exec(header);
+      const binary = atob(String(dataUrl).slice(comma + 1));
+      const bytes = new Uint8Array(binary.length);
+      for (let i = 0; i < binary.length; i += 1) bytes[i] = binary.charCodeAt(i);
+      return new Blob([bytes], { type: (typeMatch && typeMatch[1]) || 'image/png' });
+    } catch (err) {
+      return null;
+    }
+  };
+
+  const attachmentWithDataURL = async (row) => {
+    const data = row.data || (row.blob ? await blobToDataUrl(row.blob) : '');
+    return {
+      id: row.id,
+      name: row.name || 'image',
+      type: row.type || 'image/png',
+      size: row.size || 0,
+      createdAt: row.createdAt || Date.now(),
+      data
+    };
+  };
+
+  const saveAttachment = async (file) => {
+    const type = file.type || 'image/png';
+    const row = {
+      id: uid(),
+      name: file.name || 'image',
+      type,
+      size: file.size || 0,
+      createdAt: Date.now()
+    };
+    if (DB.mode === 'local') row.data = await blobToDataUrl(file);
+    else row.blob = file;
+    await DB.put('attachments', row);
+    const url = cacheAttachment(row);
+    if (!url) throw new Error('The image could not be stored.');
+    return { id: row.id, name: row.name, type: row.type, size: row.size };
+  };
+
+  const restoreAttachments = async (rows) => {
+    if (!Array.isArray(rows) || !rows.length) return 0;
+    const restored = [];
+    rows.forEach((item) => {
+      if (!item || !item.id || !item.data) return;
+      const row = {
+        id: String(item.id),
+        name: item.name || 'image',
+        type: item.type || 'image/png',
+        size: item.size || 0,
+        createdAt: item.createdAt || Date.now(),
+        data: item.data
+      };
+      if (DB.mode !== 'local') {
+        const blob = dataUrlToBlob(item.data);
+        // Bytes live in the blob in IndexedDB; keep the data URL only when the
+        // conversion failed, so the picture is never lost on import.
+        if (blob) {
+          row.blob = blob;
+          delete row.data;
+        }
+      }
+      if (row.data || row.blob) restored.push(row);
+    });
+    if (!restored.length) return 0;
+    await DB.putMany('attachments', restored);
+    restored.forEach(cacheAttachment);
+    return restored.length;
+  };
+
+  const exportAttachments = async (notes) => {
+    const referenced = new Set();
+    (Array.isArray(notes) ? notes : []).forEach((note) => collectAttachmentIds(note && note.body, referenced));
+    if (!referenced.size) return [];
+    const rows = await DB.getAll('attachments');
+    const picked = (Array.isArray(rows) ? rows : []).filter((row) => referenced.has(row.id));
+    return Promise.all(picked.map(attachmentWithDataURL));
+  };
+
+  // Images no longer referenced by any note are dropped from storage after a
+  // grace window. Two properties matter: an insert that is still settling must
+  // never lose its bytes, and an undo right after deleting an image must still
+  // find them. Both are handled by requiring an image to stay unreferenced for
+  // ATTACHMENT_TTL_MS across prune passes before it is removed.
+  const ATTACHMENT_LAST_REFERENCED = new Map();
+  const ATTACHMENT_TTL_MS = 45000;
+
+  const pruneAttachments = async (notes) => {
+    const now = Date.now();
+    const referenced = new Set();
+    (Array.isArray(notes) ? notes : []).forEach((note) => collectAttachmentIds(note && note.body, referenced));
+
+    let rows = [];
+    try {
+      rows = await DB.getAll('attachments');
+    } catch (err) {
+      return 0;
+    }
+
+    const stale = [];
+    (Array.isArray(rows) ? rows : []).forEach((row) => {
+      if (referenced.has(row.id)) {
+        ATTACHMENT_LAST_REFERENCED.set(row.id, now);
+        return;
+      }
+      const firstSeen = ATTACHMENT_LAST_REFERENCED.get(row.id);
+      if (firstSeen === undefined) {
+        ATTACHMENT_LAST_REFERENCED.set(row.id, now);
+        return;
+      }
+      if (now - firstSeen >= ATTACHMENT_TTL_MS) stale.push(row);
+    });
+
+    if (!stale.length) return 0;
+    await Promise.all(stale.map((row) => DB.remove('attachments', row.id)));
+    stale.forEach((row) => {
+      ATTACHMENT_LAST_REFERENCED.delete(row.id);
+      revokeAttachment(row.id);
+    });
+    return stale.length;
+  };
+
+  // Replaces attachment:// references with data URLs for anything that leaves
+  // Slate as plain Markdown (copy, single-note export).
+  const embedAttachmentImages = async (body) => {
+    const ids = collectAttachmentIds(body);
+    if (!ids.size) return String(body || '');
+    let output = String(body);
+    for (const id of ids) {
+      const row = await DB.get('attachments', id);
+      if (!row) continue;
+      const data = await attachmentWithDataURL(row);
+      if (data.data) output = output.split(attachmentRef(id)).join(data.data);
+    }
+    return output;
+  };
+
+  // Small module-level bus so low-level helpers (image inserts, sync) can show
+  // a toast without prop drilling from the App component.
+  const notifyToast = (detail) => {
+    try {
+      window.dispatchEvent(new CustomEvent('slate-toast', { detail: detail || {} }));
+    } catch (err) { /* noop */ }
+  };
+
+  /* --------------------------------------------------------------------------
    * File System Access helpers
    * ------------------------------------------------------------------------*/
 
@@ -1114,6 +1541,74 @@
     } catch (err) {
       try { await writable.abort(); } catch (abortErr) { /* noop */ }
       throw err;
+    }
+  };
+
+  const writeBinaryFile = async (directory, name, blob) => {
+    const fileHandle = await directory.getFileHandle(name, { create: true });
+    const writable = await fileHandle.createWritable();
+    try {
+      await writable.write(blob);
+      await writable.close();
+    } catch (err) {
+      try { await writable.abort(); } catch (abortErr) { /* noop */ }
+      throw err;
+    }
+  };
+
+  // Writes every image referenced by the notes into `attachments/` and returns
+  // an id -> file name map for them.
+  const mirrorAttachments = async (directory, notes) => {
+    const names = new Map();
+    const referenced = new Set();
+    (Array.isArray(notes) ? notes : []).forEach((note) => collectAttachmentIds(note && note.body, referenced));
+    if (!referenced.size) return names;
+
+    const attachmentsDirectory = await directory.getDirectoryHandle('attachments', { create: true });
+
+    for (const id of referenced) {
+      try {
+        const row = await DB.get('attachments', id);
+        if (!row) continue;
+        const blob = row.blob || (row.data ? dataUrlToBlob(row.data) : null);
+        if (!blob) continue;
+
+        const name = attachmentFileName(id, row.type);
+        names.set(id, name);
+
+        // Skip the write when the same bytes are already on disk.
+        let existing = null;
+        try { existing = await attachmentsDirectory.getFileHandle(name); } catch (err) { existing = null; }
+        if (existing) {
+          const file = await existing.getFile();
+          if (file && file.size === blob.size) continue;
+        }
+        await writeBinaryFile(attachmentsDirectory, name, blob);
+      } catch (err) {
+        console.warn('[slate] Could not mirror attachment', id, err);
+      }
+    }
+    return names;
+  };
+
+  // Removes image files Slate created but that no note references any more.
+  // Files Slate did not create (name prefix) are always left alone.
+  const pruneAttachmentFiles = async (directory, keep) => {
+    let attachmentsDirectory;
+    try {
+      attachmentsDirectory = await directory.getDirectoryHandle('attachments');
+    } catch (err) {
+      return; // no images were ever mirrored
+    }
+    const stale = [];
+    for await (const entry of attachmentsDirectory.values()) {
+      if (!entry || entry.kind !== 'file') continue;
+      if (!String(entry.name).startsWith('slate-')) continue;
+      if (keep.has(entry.name)) continue;
+      stale.push(entry.name);
+    }
+    for (const name of stale) {
+      try { await attachmentsDirectory.removeEntry(name); } catch (err) { /* noop */ }
     }
   };
 
@@ -1240,6 +1735,11 @@
         await writeTextFile(directory, 'notebooks.json', JSON.stringify(notebooksPayload, null, 2));
 
         const notesDirectory = await directory.getDirectoryHandle('notes', { create: true });
+        // Screenshots are written beside the notes so the Markdown files stay
+        // readable by any other app.
+        const mirrored = await mirrorAttachments(directory, currentNotes);
+        const attachmentPaths = new Map();
+        mirrored.forEach((name, id) => attachmentPaths.set(id, `../attachments/${name}`));
         const nextFiles = {};
 
         for (const note of currentNotes) {
@@ -1249,10 +1749,13 @@
             try { await notesDirectory.removeEntry(previous); } catch (err) { /* already gone */ }
           }
           await writeTextFile(notesDirectory, name, noteToMarkdown(note, {
-            notebook: notebookById.get(note.notebookId) || null
+            notebook: notebookById.get(note.notebookId) || null,
+            attachmentPaths
           }));
           nextFiles[note.id] = name;
         }
+
+        await pruneAttachmentFiles(directory, new Set(mirrored.values()));
 
         // Remove mirrors of deleted notes, but only files we created ourselves.
         for (const [noteId, name] of Object.entries(filesRef.current)) {
@@ -1448,7 +1951,7 @@
       }
       const ok = await doSync({ manual: true });
       if (ok) {
-        toastRef.current({ tone: 'success', title: 'Synced to disk', description: 'tasks.json, notebooks.json and your Markdown notes are up to date.', duration: 2500 });
+        toastRef.current({ tone: 'success', title: 'Synced to disk', description: 'tasks.json, notebooks.json, your Markdown notes and attachments are up to date.', duration: 2500 });
       }
       return ok;
     }, [doSync]);
@@ -1573,7 +2076,7 @@
         '- Press **Ctrl + N** to start a new note.',
         '- Press **Ctrl + Enter** to jump to the task composer.',
         '- Press **Ctrl + K** to search notes, **Ctrl + S** to force a save.',
-        '- Use the **Rich / Source / Preview** switch above the note to format visually, edit Markdown directly, or read the rendered result.',
+        '- Use the **Edit / Display** button above the note to write with formatting or read the rendered result.',
         '',
         '## Notebooks',
         'Notes live inside notebooks. Use the notebook list on the left to collapse a group, add a note to it, or rename it. Move a note any time with the notebook selector above its title.',
@@ -1584,13 +2087,17 @@
         '- `tasks.json` — all tasks in a single file',
         '- `notebooks.json` — your notebooks',
         '- `notes/*.md` — one Markdown file per note',
+        '- `attachments/` — the images embedded in those notes',
         '',
         '> Keep the folder inside OneDrive or Dropbox for a free, portable version history.',
         '',
         'When you are offline, everything keeps working. Changes sync back to disk as soon as the folder is available again.',
         '',
         '## Formatting',
-        'Use the toolbar above the note body for **bold**, _italic_, ~~strikethrough~~, `inline code`, headings, bulleted and numbered lists, checklists, quotes, code blocks, links and dividers. **Ctrl + B** and **Ctrl + I** work too. Under the hood every note is still Markdown — **Source** shows the raw text and **Preview** renders it.',
+        'Use the toolbar above the note body for **bold**, _italic_, ~~strikethrough~~, `inline code`, headings, bulleted and numbered lists, checklists, quotes, code blocks, links, images and dividers. **Ctrl + B** and **Ctrl + I** work too. Under the hood every note is still Markdown — **Display** renders it, and **Edit** brings the toolbar back.',
+        '',
+        '## Screenshots',
+        'Press **Ctrl + V** to paste a screenshot straight into the note, drag an image onto the body, or use the image button in the toolbar. Images live inside the note — they travel with backups and mirror to `attachments/` when a folder is connected. Give each one a short description: the text is searchable, so “invoice total” finds the picture again.',
         '',
         '- [x] Install Slate as a desktop app',
         '- [ ] Connect a local folder',
@@ -1690,6 +2197,7 @@
     codeBlock: <><rect x="3" y="4" width="18" height="16" rx="2" /><path d="m9.5 10-2 2 2 2M14.5 10l2 2-2 2" /></>,
     link: <><path d="M10.5 13.5a4.5 4.5 0 0 0 6.4.1l2-2a4.5 4.5 0 0 0-6.4-6.4l-1.1 1.1" /><path d="M13.5 10.5a4.5 4.5 0 0 0-6.4-.1l-2 2a4.5 4.5 0 0 0 6.4 6.4l1.1-1.1" /></>,
     minus: <path d="M4 12h16" />,
+    image: <><rect x="3" y="4.5" width="18" height="15" rx="2.5" /><circle cx="8.5" cy="9.5" r="1.6" /><path d="m4.5 17 4.6-4.6a1.8 1.8 0 0 1 2.5 0l5.4 5.4" /><path d="m15 13 1.6-1.6a1.8 1.8 0 0 1 2.5 0L20 12.4" /></>,
     layout: <><rect x="3" y="4" width="18" height="16" rx="2" /><path d="M9 4v16" /></>,
     notes: <><path d="M5 4h11l3 3v13H5V4Z" /><path d="M8 9h8M8 13h8M8 17h5" /></>,
     cloudOff: <><path d="M3 3l18 18" /><path d="M7 7.5A5 5 0 0 1 17 10a3.5 3.5 0 0 1 3 5" /><path d="M17 19H7a4 4 0 0 1-.6-8" /></>,
@@ -1747,7 +2255,7 @@
       <button
         type={type}
         className={cx(
-          'inline-flex select-none items-center justify-center gap-1.5 rounded-lg px-2.5 py-1.5 text-[13.2px] font-medium transition-colors disabled:pointer-events-none disabled:opacity-40 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent/40',
+          'inline-flex select-none items-center justify-center gap-1.5 rounded-lg px-2.5 py-1.5 text-[13.2px] font-medium transition-colors disabled:pointer-events-none disabled:opacity-60 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent/40',
           BUTTON_VARIANTS[variant],
           className
         )}
@@ -1766,7 +2274,7 @@
         aria-label={label}
         title={label}
         className={cx(
-          'grid h-8 w-8 shrink-0 place-items-center rounded-lg text-muted transition-colors hover:bg-line/5 hover:text-ink focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent/40 disabled:pointer-events-none disabled:opacity-40',
+          'grid h-8 w-8 shrink-0 place-items-center rounded-lg text-muted transition-colors hover:bg-line/5 hover:text-ink focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent/40 disabled:pointer-events-none disabled:opacity-60',
           className
         )}
         {...rest}
@@ -1781,6 +2289,7 @@
       <div role="tablist" aria-label={ariaLabel} className={cx('inline-flex items-center gap-0.5 rounded-lg bg-line/[0.045] p-0.5', className)}>
         {options.map((option) => {
           const active = value === option.value;
+          const hue = option.hue ? tone(option.hue) : null;
           return (
             <button
               key={option.value}
@@ -1790,10 +2299,12 @@
               onClick={() => onChange(option.value)}
               className={cx(
                 'inline-flex items-center gap-1.5 rounded-[7px] px-2 py-1 text-[12.65px] font-medium transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent/40',
-                active ? 'bg-panel text-ink shadow-sm' : 'text-muted hover:text-ink'
+                active
+                  ? (hue ? hue.active : 'bg-panel text-ink shadow-sm')
+                  : 'text-muted hover:bg-line/[0.05] hover:text-ink'
               )}
             >
-              {option.icon ? <Icon name={option.icon} size={12} /> : null}
+              {option.icon ? <Icon name={option.icon} size={12} className={active || !hue ? '' : hue.text} /> : null}
               {option.label ? <span>{option.label}</span> : null}
             </button>
           );
@@ -1840,7 +2351,7 @@
                 type="button"
                 onClick={() => onDismiss(toast.id)}
                 aria-label="Dismiss notification"
-                className="-mr-1 -mt-0.5 grid h-6 w-6 shrink-0 place-items-center rounded-md text-muted/70 transition-colors hover:bg-line/5 hover:text-ink"
+                className="-mr-1 -mt-0.5 grid h-6 w-6 shrink-0 place-items-center rounded-md text-muted transition-colors hover:bg-line/5 hover:text-ink"
               >
                 <Icon name="x" size={12} />
               </button>
@@ -2029,7 +2540,7 @@
 
           <SettingsSection
             title="Local folder"
-            description="Mirror notebooks, notes and tasks to a folder on your PC. Slate writes tasks.json, notebooks.json, plus one Markdown file per note."
+            description="Mirror notebooks, notes and tasks to a folder on your PC. Slate writes tasks.json, notebooks.json, one Markdown file per note, and an attachments folder for embedded images."
           >
             <div className="rounded-xl border border-line/8 bg-raised/50 p-3">
               <div className="flex items-start gap-3">
@@ -2178,7 +2689,7 @@
     { label: 'New task', keys: ['Ctrl', 'Enter'] },
     { label: 'Search notes', keys: ['Ctrl', 'K'] },
     { label: 'Save and sync', keys: ['Ctrl', 'S'] },
-    { label: 'Cycle editor view', keys: ['Ctrl', 'E'] },
+    { label: 'Switch edit / display', keys: ['Ctrl', 'E'] },
     { label: 'Switch view', keys: ['Ctrl', '1', '2', '3'] },
     { label: 'Show shortcuts', keys: ['?'] },
     { label: 'Close dialog', keys: ['Esc'] }
@@ -2252,7 +2763,7 @@
             placeholder="e.g. Projects"
             autoComplete="off"
             spellCheck="false"
-            className="h-9 w-full rounded-lg border border-line/10 bg-panel px-3 text-[14.3px] text-ink outline-none transition focus:border-accent/30 focus:ring-2 focus:ring-accent/[0.08] placeholder:text-muted/50"
+            className="h-9 w-full rounded-lg border border-line/10 bg-panel px-3 text-[14.3px] text-ink outline-none transition focus:border-accent/30 focus:ring-2 focus:ring-accent/[0.08] placeholder:text-muted"
           />
           <p className="mt-2 text-[11.55px] leading-relaxed text-muted">
             Every note belongs to one notebook. Use the selector above a note’s title to move it.
@@ -2414,7 +2925,7 @@
             title={`Priority: ${meta.label}`}
             className={cx(
               'inline-flex items-center gap-1 rounded-md px-1.5 py-[3px] text-[11.55px] leading-4 transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent/40',
-              isSet ? cx('border', meta.chip, 'hover:brightness-95') : 'text-muted/70 hover:bg-line/5 hover:text-ink'
+              isSet ? cx('border', meta.chip, 'hover:brightness-95') : 'text-muted hover:bg-line/5 hover:text-ink'
             )}
           >
             {isSet ? <span className={cx('h-1.5 w-1.5 rounded-full', meta.dot)} /> : <Icon name="flag" size={11} />}
@@ -2446,7 +2957,7 @@
     };
 
     const tone = !info
-      ? 'text-muted/70 hover:bg-line/5 hover:text-ink'
+      ? 'text-muted hover:bg-line/5 hover:text-ink'
       : info.tone === 'overdue'
         ? 'border border-rose-500/20 bg-rose-500/10 text-rose-600 dark:text-rose-300'
         : info.tone === 'today'
@@ -2474,7 +2985,7 @@
             onClick={() => onChange(null)}
             aria-label="Clear due date"
             title="Clear due date"
-            className="ml-0.5 grid h-[18px] w-[18px] place-items-center rounded text-muted/60 transition-colors hover:bg-line/5 hover:text-ink"
+            className="ml-0.5 grid h-[18px] w-[18px] place-items-center rounded text-muted transition-colors hover:bg-line/5 hover:text-ink"
           >
             <Icon name="x" size={9} />
           </button>
@@ -2536,7 +3047,7 @@
         )}
       >
         <div className="flex items-center gap-2 px-3 py-2">
-          <Icon name="plus" size={15} className="shrink-0 text-muted/60" />
+          <Icon name="plus" size={15} className="shrink-0 text-muted" />
           <input
             ref={inputRef}
             value={title}
@@ -2546,7 +3057,7 @@
             aria-label="New task title"
             autoComplete="off"
             spellCheck="false"
-            className="min-w-0 flex-1 bg-transparent py-0.5 text-[14.3px] leading-5 text-ink outline-none placeholder:text-muted/60"
+            className="min-w-0 flex-1 bg-transparent py-0.5 text-[14.3px] leading-5 text-ink outline-none placeholder:text-muted"
           />
           <span className="hidden items-center gap-1 lg:flex" aria-hidden="true">
             <Kbd>Ctrl</Kbd>
@@ -2559,7 +3070,7 @@
               'rounded-md px-2 py-1 text-[12.1px] font-semibold transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent/40',
               title.trim()
                 ? 'bg-accent text-white hover:opacity-90 dark:text-[#0b0c0e]'
-                : 'cursor-default text-muted/40'
+                : 'cursor-default text-muted'
             )}
           >
             Add
@@ -2570,7 +3081,7 @@
           <div className="flex flex-wrap items-center gap-1.5 border-t border-line/8 px-2.5 py-1.5 animate-fade-in">
             <PriorityControl value={priority} onChange={setPriority} />
             <DueControl due={due} onChange={setDue} />
-            <span className="ml-auto hidden select-none text-[11px] text-muted/60 sm:block">
+            <span className="ml-auto hidden select-none text-[11px] text-muted sm:block">
               {title.trim() ? 'Enter to add' : 'Details are optional'}
             </span>
           </div>
@@ -2609,10 +3120,7 @@
     };
 
     return (
-      <li className={cx(
-        'group relative flex items-start gap-3 rounded-lg px-2.5 py-2 transition-colors hover:bg-line/[0.03]',
-        task.done && 'opacity-65'
-      )}>
+      <li className="group relative flex items-start gap-3 rounded-lg px-2.5 py-2 transition-colors hover:bg-line/[0.03]">
         <button
           type="button"
           role="checkbox"
@@ -2661,7 +3169,7 @@
             <PriorityControl value={task.priority} onChange={(priority) => onUpdate(task.id, { priority })} />
             <DueControl due={task.due} onChange={(due) => onUpdate(task.id, { due })} />
             {task.done && task.completedAt ? (
-              <span className="px-1 text-[11px] text-muted/70">Completed {formatRelative(task.completedAt)}</span>
+              <span className="px-1 text-[11px] text-muted">Completed {formatRelative(task.completedAt)}</span>
             ) : null}
           </div>
         </div>
@@ -2722,13 +3230,18 @@
         <div className="shrink-0 px-4 pt-4 sm:px-5">
           <div className={contentWidth}>
             <div className="mb-3 flex items-start justify-between gap-3">
-              <div>
-                <h1 className="text-[16.5px] font-semibold tracking-[-0.015em] text-ink">Tasks</h1>
-                <p className="mt-0.5 text-[12.1px] text-muted">
-                  {counts.active} open · {counts.done} done
-                </p>
+              <div className="flex items-start gap-2">
+                <span className="mt-0.5 grid h-[22px] w-[22px] place-items-center rounded-[7px] border border-c3/25 bg-c3/10 text-c3">
+                  <Icon name="listChecks" size={12} />
+                </span>
+                <div>
+                  <h1 className="text-[16.5px] font-semibold tracking-[-0.015em] text-ink">Tasks</h1>
+                  <p className="mt-0.5 text-[12.1px] text-muted">
+                    {counts.active} open · {counts.done} done
+                  </p>
+                </div>
               </div>
-              <span className="mt-1 select-none text-[11px] uppercase tracking-[0.16em] text-muted/60">
+              <span className="mt-1 select-none text-[11px] uppercase tracking-[0.16em] text-muted">
                 {new Date().toLocaleDateString(undefined, { weekday: 'short', month: 'short', day: 'numeric' })}
               </span>
             </div>
@@ -2742,9 +3255,9 @@
               value={filter}
               onChange={onFilterChange}
               options={[
-                { value: 'all', label: 'All' },
-                { value: 'active', label: 'Active' },
-                { value: 'done', label: 'Completed' }
+                { value: 'all', label: 'All', hue: 'violet' },
+                { value: 'active', label: 'Active', hue: 'amber' },
+                { value: 'done', label: 'Completed', hue: 'emerald' }
               ]}
               ariaLabel="Filter tasks"
             />
@@ -2775,7 +3288,7 @@
 
           {visibleTasks.length === 0 ? (
             <div className="flex h-full min-h-[220px] flex-col items-center justify-center px-6 pb-6 text-center">
-              <div className="grid h-11 w-11 place-items-center rounded-2xl border border-line/10 bg-raised text-muted/70">
+              <div className="grid h-11 w-11 place-items-center rounded-2xl border border-line/10 bg-raised text-muted">
                 <Icon name={filter === 'done' ? 'check' : 'listChecks'} size={18} />
               </div>
               <p className="mt-3 text-[13.75px] font-medium text-ink">{emptyCopy.title}</p>
@@ -2788,11 +3301,11 @@
           <div className={cx('flex items-center gap-3', contentWidth)}>
             <div className="h-1 flex-1 overflow-hidden rounded-full bg-line/[0.07]">
               <div
-                className="h-full rounded-full bg-accent/70 transition-[width] duration-300"
+                className="h-full rounded-full bg-gradient-to-r from-c3 via-c2 to-c1 transition-[width] duration-300"
                 style={{ width: `${percent}%` }}
               />
             </div>
-            <span className="w-8 text-right text-[11.55px] tabular-nums text-muted">{percent}%</span>
+            <span className="w-8 text-right text-[11.55px] font-semibold tabular-nums text-c3">{percent}%</span>
           </div>
         </div>
       </section>
@@ -2803,25 +3316,31 @@
    * Notes
    * ------------------------------------------------------------------------*/
 
-  function NoteListItem({ note, active, onSelect, onDelete }) {
+  function NoteListItem({ note, active, tone: hueTone, onSelect, onDelete }) {
+    const hue = hueTone || TONES.violet;
     return (
       <div className={cx(
-        'group relative rounded-lg transition-colors',
-        active ? 'bg-panel shadow-soft ring-1 ring-line/[0.05]' : 'hover:bg-line/[0.04]'
+        'group relative overflow-hidden rounded-lg transition-colors',
+        active ? cx('shadow-soft ring-1', hue.tint, hue.ring) : 'hover:bg-line/[0.04]'
       )}>
+        {active ? (
+          <span className={cx('absolute inset-y-1.5 left-0 w-[3px] rounded-full', hue.bar)} />
+        ) : null}
         <button
           type="button"
           onClick={onSelect}
           className="block w-full px-3 py-2.5 text-left focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-accent/30"
         >
           <div className="flex items-center gap-1.5 pr-6">
-            {note.pinned ? <Icon name="pin" size={10} className="shrink-0 text-muted" /> : null}
+            {note.pinned ? (
+              <Icon name="pin" size={10} className={cx('shrink-0', active ? hue.text : 'text-muted')} />
+            ) : null}
             <span className={cx('truncate text-[13.75px] leading-4', active ? 'font-semibold text-ink' : 'font-medium text-ink')}>
               {noteTitle(note)}
             </span>
           </div>
           <p className="mt-1 truncate text-[12.1px] leading-4 text-muted">{noteExcerpt(note)}</p>
-          <div className="mt-1 text-[11px] text-muted/70">{formatRelative(note.updatedAt)}</div>
+          <div className="mt-1 text-[11px] text-muted">{formatRelative(note.updatedAt)}</div>
         </button>
 
         <button
@@ -2829,7 +3348,7 @@
           onClick={(event) => { event.stopPropagation(); onDelete(note); }}
           aria-label={`Delete ${noteTitle(note)}`}
           title="Delete note"
-          className="absolute right-1.5 top-2 grid h-6 w-6 place-items-center rounded-md text-muted/60 opacity-0 transition-all hover:bg-line/5 hover:text-rose-600 focus-visible:opacity-100 group-hover:opacity-100 max-sm:opacity-100"
+          className="absolute right-1.5 top-2 grid h-6 w-6 place-items-center rounded-md text-muted opacity-0 transition-all hover:bg-line/5 hover:text-rose-600 focus-visible:opacity-100 group-hover:opacity-100 max-sm:opacity-100"
         >
           <Icon name="trash" size={12} />
         </button>
@@ -2864,6 +3383,7 @@
     const lastValueRef = useRef(value);
     const onChangeRef = useRef(onChange);
     const composingRef = useRef(false);
+    const fileInputRef = useRef(null);
     const [empty, setEmpty] = useState(() => !String(value || '').trim());
     const [format, setFormat] = useState({
       bold: false, italic: false, strike: false, ul: false, ol: false, block: ''
@@ -3121,9 +3641,65 @@
       });
     };
 
+    const imageMarkup = (record) => {
+      const alt = String(record.name || '')
+        .replace(/\.[a-z0-9]+$/i, '')
+        .replace(/[[\]\r\n]+/g, ' ')
+        .replace(/\s+/g, ' ')
+        .trim()
+        .slice(0, 160) || 'Image';
+      const src = attachmentUrl(record.id) || missingImagePlaceholder();
+      return `<img src="${escapeHtml(src)}" alt="${escapeHtml(alt)}" data-attachment="${escapeHtml(record.id)}">`;
+    };
+
+    // Screenshots and other images become attachments: bytes in IndexedDB,
+    // reference in the Markdown body.
+    const insertImages = async (files) => {
+      const element = innerRef.current;
+      const records = [];
+
+      for (const file of Array.from(files || [])) {
+        if (!file) continue;
+        const isImage = file.type
+          ? file.type.indexOf('image/') === 0
+          : /\.(png|jpe?g|gif|webp|bmp|avif|svg)$/i.test(file.name || '');
+        if (!isImage) continue;
+        try {
+          records.push(await saveAttachment(file));
+        } catch (err) {
+          notifyToast({
+            tone: 'error',
+            title: 'Could not add image',
+            description: (err && err.message) || 'Local storage may be full. Export a backup, then remove some images.',
+            duration: 7000
+          });
+        }
+      }
+
+      if (!records.length || !element) return;
+      element.focus();
+      try {
+        document.execCommand('insertHTML', false, records.map(imageMarkup).join(''));
+      } catch (err) {
+        notifyToast({ tone: 'error', title: 'Could not add image', description: 'The editor rejected the insert. Try again.' });
+        return;
+      }
+      syncFromDom();
+      refreshFormat();
+    };
+
     const handlePaste = (event) => {
       const clipboard = event.clipboardData;
       if (!clipboard) return;
+
+      // A screenshot on the clipboard arrives as a file — that wins over HTML.
+      const pastedFiles = Array.from(clipboard.files || []).filter((file) => file && file.type.indexOf('image/') === 0);
+      if (pastedFiles.length) {
+        event.preventDefault();
+        insertImages(pastedFiles);
+        return;
+      }
+
       const html = clipboard.getData('text/html');
       if (!html) return;
 
@@ -3137,6 +3713,39 @@
         else document.execCommand('insertText', false, clipboard.getData('text/plain') || '');
       } catch (err) { /* noop */ }
       syncFromDom();
+    };
+
+    const handleDragOver = (event) => {
+      const transfer = event.dataTransfer;
+      if (!transfer) return;
+      const hasFiles = transfer.types && Array.from(transfer.types).indexOf('Files') !== -1;
+      if (!hasFiles) return;
+      event.preventDefault();
+      transfer.dropEffect = 'copy';
+    };
+
+    const handleDrop = (event) => {
+      const files = event.dataTransfer ? Array.from(event.dataTransfer.files || []) : [];
+      if (!files.length) return;
+      event.preventDefault();
+
+      // Land the caret where the image was dropped.
+      const element = innerRef.current;
+      if (element && typeof document.caretRangeFromPoint === 'function') {
+        try {
+          const range = document.caretRangeFromPoint(event.clientX, event.clientY);
+          if (range && element.contains(range.startContainer)) {
+            element.focus();
+            const selection = window.getSelection();
+            if (selection) {
+              selection.removeAllRanges();
+              selection.addRange(range);
+            }
+          }
+        } catch (err) { /* noop */ }
+      }
+
+      insertImages(files);
     };
 
     const handleClick = (event) => {
@@ -3215,7 +3824,7 @@
         <div
           role="toolbar"
           aria-label="Text formatting"
-          className="mb-2.5 flex flex-wrap items-center gap-0.5 rounded-lg border border-line/8 bg-line/[0.02] px-1 py-1"
+          className="sticky top-0 z-10 mb-2.5 flex flex-wrap items-center gap-0.5 rounded-lg border border-line/8 bg-panel px-1 py-1 shadow-[0_1px_0_rgb(var(--line)/0.03)]"
         >
           <EditorTool label="Bold" hint="Ctrl+B" active={format.bold} onClick={() => runCommand('bold')}>
             <span className="font-bold">B</span>
@@ -3259,10 +3868,27 @@
           <EditorTool label="Insert link" onClick={applyLink}>
             <Icon name="link" size={13} />
           </EditorTool>
+          <EditorTool label="Insert image" hint="Ctrl+V" onClick={() => fileInputRef.current && fileInputRef.current.click()}>
+            <Icon name="image" size={14} />
+          </EditorTool>
           <EditorTool label="Divider" onClick={() => runCommand('insertHorizontalRule')}>
             <Icon name="minus" size={14} />
           </EditorTool>
         </div>
+
+        <input
+          ref={fileInputRef}
+          type="file"
+          accept="image/*"
+          multiple
+          className="hidden"
+          aria-label="Choose images"
+          onChange={(event) => {
+            const files = Array.from(event.target.files || []);
+            event.target.value = '';
+            if (files.length) insertImages(files);
+          }}
+        />
 
         <div className="relative">
           <div
@@ -3274,10 +3900,12 @@
             aria-label="Note body"
             aria-placeholder={placeholder}
             spellCheck
-            className="md rich-editor block w-full text-[15.95px] leading-7 text-ink/90"
+            className="md rich-editor block w-full text-[15.95px] leading-7 text-muted"
             onInput={() => { if (!composingRef.current) syncFromDom(); }}
             onKeyDown={handleKeyDown}
             onPaste={handlePaste}
+            onDragOver={handleDragOver}
+            onDrop={handleDrop}
             onClick={handleClick}
             onBlur={syncFromDom}
             onCompositionStart={() => { composingRef.current = true; }}
@@ -3286,7 +3914,7 @@
           {empty ? (
             <p
               aria-hidden="true"
-              className="pointer-events-none absolute left-0 top-0 m-0 text-[15.95px] leading-7 text-muted/40"
+              className="pointer-events-none absolute left-0 top-0 m-0 text-[15.95px] leading-7 text-muted"
             >
               {placeholder}
             </p>
@@ -3313,52 +3941,10 @@
   }) {
     const bodyRef = useRef(null);
 
-    const wrapSelection = (prefix, suffix) => {
-      const element = bodyRef.current;
-      if (!element) return;
-      const start = element.selectionStart;
-      const end = element.selectionEnd;
-      const selected = note.body.slice(start, end);
-      const next = note.body.slice(0, start) + prefix + selected + suffix + note.body.slice(end);
-      onUpdate(note.id, { body: next });
-      requestAnimationFrame(() => {
-        element.focus();
-        const cursorStart = start + prefix.length;
-        element.selectionStart = cursorStart;
-        element.selectionEnd = cursorStart + selected.length;
-      });
-    };
-
-    const onBodyKeyDown = (event) => {
-      const mod = event.ctrlKey || event.metaKey;
-      if (mod && event.key.toLowerCase() === 'b') {
-        event.preventDefault();
-        wrapSelection('**', '**');
-        return;
-      }
-      if (mod && event.key.toLowerCase() === 'i') {
-        event.preventDefault();
-        wrapSelection('_', '_');
-        return;
-      }
-      if (event.key === 'Tab') {
-        event.preventDefault();
-        const element = event.currentTarget;
-        const start = element.selectionStart;
-        const end = element.selectionEnd;
-        const next = note.body.slice(0, start) + '  ' + note.body.slice(end);
-        onUpdate(note.id, { body: next });
-        requestAnimationFrame(() => {
-          element.selectionStart = start + 2;
-          element.selectionEnd = start + 2;
-        });
-      }
-    };
-
     if (!note) {
       return (
         <div className="flex h-full flex-col items-center justify-center px-8 text-center">
-          <div className="grid h-12 w-12 place-items-center rounded-2xl border border-line/10 bg-raised text-muted/70">
+          <div className="grid h-12 w-12 place-items-center rounded-2xl border border-line/10 bg-raised text-muted">
             <Icon name="notes" size={20} />
           </div>
           <p className="mt-4 text-[14.3px] font-medium text-ink">Nothing selected</p>
@@ -3389,15 +3975,11 @@
             value={editorMode}
             onChange={onEditorModeChange}
             options={[
-              { value: 'rich', label: 'Rich', icon: 'pencil' },
-              { value: 'markdown', label: 'Source', icon: 'code' },
-              { value: 'preview', label: 'Preview', icon: 'eye' }
+              { value: 'edit', label: 'Edit', icon: 'pencil', hue: 'violet' },
+              { value: 'display', label: 'Display', icon: 'eye', hue: 'emerald' }
             ]}
-            ariaLabel="Editor mode"
+            ariaLabel="Edit or display note"
           />
-          <span className="ml-1 hidden text-[11.55px] text-muted lg:block">
-            {editorMode === 'preview' ? 'Read mode' : editorMode === 'markdown' ? 'Markdown source' : 'Rich text'}
-          </span>
 
           <div className="ml-auto flex items-center gap-0.5">
             <IconButton
@@ -3417,7 +3999,7 @@
           <div className="mx-auto w-full max-w-[740px] px-5 pb-20 pt-6 sm:px-9 sm:pt-8">
             <div className="mb-2.5 flex flex-wrap items-center gap-2">
               <div className="relative inline-flex items-center">
-                <Icon name="folder" size={11} className="pointer-events-none absolute left-2 text-muted/70" />
+                <Icon name="folder" size={11} className="pointer-events-none absolute left-2 text-muted" />
                 <select
                   value={note.notebookId || ''}
                   onChange={(event) => onMoveNotebook(note.id, event.target.value)}
@@ -3429,7 +4011,7 @@
                     <option key={item.id} value={item.id}>{item.name}</option>
                   ))}
                 </select>
-                <Icon name="chevronDown" size={10} className="pointer-events-none absolute right-1.5 text-muted/70" />
+                <Icon name="chevronDown" size={10} className="pointer-events-none absolute right-1.5 text-muted" />
               </div>
             </div>
 
@@ -3437,6 +4019,7 @@
               ref={titleInputRef}
               data-note-title
               value={note.title}
+              readOnly={editorMode === 'display'}
               onChange={(event) => onUpdate(note.id, { title: event.target.value })}
               onKeyDown={(event) => {
                 if (event.key === 'Enter') {
@@ -3444,7 +4027,7 @@
                   const element = bodyRef.current;
                   if (!element) return;
                   element.focus();
-                  if (editorMode === 'rich') {
+                  if (editorMode !== 'display') {
                     const range = document.createRange();
                     range.selectNodeContents(element);
                     range.collapse(false);
@@ -3460,14 +4043,14 @@
               aria-label="Note title"
               autoComplete="off"
               spellCheck="false"
-              className="w-full bg-transparent text-[26.4px] font-semibold leading-[1.2] tracking-[-0.02em] text-ink outline-none placeholder:text-muted/30 sm:text-[29.7px]"
+              className="w-full bg-transparent text-[26.4px] font-semibold leading-[1.2] tracking-[-0.02em] text-ink outline-none placeholder:text-muted sm:text-[29.7px]"
             />
 
-            <div className="mt-2 flex flex-wrap items-center gap-x-2 gap-y-1 text-[11.55px] text-muted/80">
+            <div className="mt-2 flex flex-wrap items-center gap-x-2 gap-y-1 text-[11.55px] text-muted">
               <span>Edited {formatRelative(note.updatedAt)}</span>
-              <span className="text-muted/35">·</span>
+              <span className="text-muted">·</span>
               <span>{words} {words === 1 ? 'word' : 'words'}</span>
-              <span className="text-muted/35">·</span>
+              <span className="text-muted">·</span>
               <span className="inline-flex items-center gap-1">
                 <span className="h-1.5 w-1.5 rounded-full bg-emerald-500/80" />
                 Autosaved
@@ -3475,25 +4058,14 @@
             </div>
 
             <div className="mt-6">
-              {editorMode === 'preview' ? (
+              {editorMode === 'display' ? (
                 note.body.trim() ? (
                   <div className="md" dangerouslySetInnerHTML={{ __html: renderMarkdown(note.body) }} />
                 ) : (
-                  <p className="text-[14.3px] italic text-muted/70">
-                    Nothing to preview yet. Switch to Rich text and start typing.
+                  <p className="text-[14.3px] italic text-muted">
+                    Nothing to display yet. Switch to Edit and start writing.
                   </p>
                 )
-              ) : editorMode === 'markdown' ? (
-                <textarea
-                  ref={bodyRef}
-                  value={note.body}
-                  onChange={(event) => onUpdate(note.id, { body: event.target.value })}
-                  onKeyDown={onBodyKeyDown}
-                  placeholder="Write Markdown here — headings, lists, quotes, links, and code."
-                  aria-label="Note body"
-                  spellCheck
-                  className="block min-h-[46vh] w-full resize-none overflow-hidden bg-transparent text-[15.95px] leading-7 text-ink/90 outline-none placeholder:text-muted/40"
-                />
               ) : (
                 <RichTextEditor
                   noteId={note.id}
@@ -3505,21 +4077,11 @@
               )}
             </div>
 
-            {editorMode !== 'preview' ? (
-              <div className="mt-8 flex flex-wrap items-center gap-x-3 gap-y-1 border-t border-line/8 pt-3 text-[11px] text-muted/60">
-                {editorMode === 'rich' ? (
-                  <>
-                    <span className="inline-flex items-center gap-1"><Kbd>Ctrl</Kbd><Kbd>B</Kbd> bold</span>
-                    <span className="inline-flex items-center gap-1"><Kbd>Ctrl</Kbd><Kbd>I</Kbd> italic</span>
-                    <span className="inline-flex items-center gap-1"><Kbd>Ctrl</Kbd><Kbd>E</Kbd> change view</span>
-                  </>
-                ) : (
-                  <>
-                    <span>Markdown source</span>
-                    <span className="inline-flex items-center gap-1"><Kbd>Ctrl</Kbd><Kbd>B</Kbd> bold</span>
-                    <span className="inline-flex items-center gap-1"><Kbd>Ctrl</Kbd><Kbd>I</Kbd> italic</span>
-                  </>
-                )}
+            {editorMode !== 'display' ? (
+              <div className="mt-8 flex flex-wrap items-center gap-x-3 gap-y-1 border-t border-line/8 pt-3 text-[11px] text-muted">
+                <span className="inline-flex items-center gap-1"><Kbd>Ctrl</Kbd><Kbd>B</Kbd> bold</span>
+                <span className="inline-flex items-center gap-1"><Kbd>Ctrl</Kbd><Kbd>I</Kbd> italic</span>
+                <span className="inline-flex items-center gap-1"><Kbd>Ctrl</Kbd><Kbd>E</Kbd> display</span>
                 <span className="ml-auto hidden sm:inline">Autosaves as you type</span>
               </div>
             ) : null}
@@ -3537,7 +4099,7 @@
         aria-label={label}
         title={label}
         className={cx(
-          'grid h-5 w-5 place-items-center rounded text-muted/60 transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent/30',
+          'grid h-5 w-5 place-items-center rounded text-muted transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent/30',
           danger
             ? 'hover:bg-rose-500/10 hover:text-rose-600 dark:hover:text-rose-300'
             : 'hover:bg-line/8 hover:text-ink'
@@ -3595,13 +4157,18 @@
     return (
       <section className="flex min-h-0 min-w-0 flex-1 bg-panel" aria-label="Notes">
         <div className={cx(
-          'flex w-full shrink-0 flex-col border-r border-line/8 bg-app sm:w-[264px] xl:w-[292px]',
+          'nav-wash flex w-full shrink-0 flex-col border-r border-line/8 bg-app sm:w-[264px] xl:w-[292px]',
           mobileEditor ? 'hidden sm:flex' : 'flex'
         )}>
           <div className="flex items-center justify-between gap-2 px-4 pb-2 pt-4">
-            <div className="flex items-baseline gap-2">
-              <h1 className="text-[16.5px] font-semibold tracking-[-0.015em] text-ink">Notes</h1>
-              <span className="text-[11.55px] tabular-nums text-muted">{notes.length}</span>
+            <div className="flex items-center gap-2">
+              <span className="grid h-[22px] w-[22px] place-items-center rounded-[7px] border border-c1/25 bg-c1/10 text-c1">
+                <Icon name="notes" size={12} />
+              </span>
+              <div className="flex items-baseline gap-1.5">
+                <h1 className="text-[16.5px] font-semibold tracking-[-0.015em] text-ink">Notes</h1>
+                <span className="rounded-full border border-c1/20 bg-c1/10 px-1.5 text-[10.45px] font-semibold tabular-nums leading-[17px] text-c1">{notes.length}</span>
+              </div>
             </div>
             <div className="flex items-center gap-0.5">
               <IconButton label="New notebook" icon="folderPlus" onClick={onCreateNotebook} />
@@ -3614,7 +4181,7 @@
               <Icon
                 name="search"
                 size={13}
-                className="pointer-events-none absolute left-2.5 top-1/2 -translate-y-1/2 text-muted/60"
+                className="pointer-events-none absolute left-2.5 top-1/2 -translate-y-1/2 text-muted"
               />
               <input
                 ref={searchRef}
@@ -3624,7 +4191,7 @@
                 aria-label="Search notes"
                 autoComplete="off"
                 spellCheck="false"
-                className="h-8 w-full rounded-lg border border-line/10 bg-panel pl-8 pr-14 text-[13.2px] text-ink outline-none transition focus:border-accent/25 focus:ring-2 focus:ring-accent/[0.07] placeholder:text-muted/50"
+                className="h-8 w-full rounded-lg border border-line/10 bg-panel pl-8 pr-14 text-[13.2px] text-ink outline-none transition focus:border-accent/25 focus:ring-2 focus:ring-accent/[0.07] placeholder:text-muted"
               />
               {query ? (
                 <button
@@ -3646,7 +4213,7 @@
           <div className="scroll-thin min-h-0 flex-1 overflow-y-auto px-2 pb-3">
             {query && filteredNotes.length === 0 ? (
               <div className="flex flex-col items-center px-3 py-10 text-center">
-                <div className="grid h-9 w-9 place-items-center rounded-xl border border-line/10 bg-panel text-muted/60">
+                <div className="grid h-9 w-9 place-items-center rounded-xl border border-line/10 bg-panel text-muted">
                   <Icon name="search" size={15} />
                 </div>
                 <p className="mt-3 text-[13.2px] font-medium text-ink">No matches</p>
@@ -3659,7 +4226,7 @@
               </div>
             ) : notebookGroups.length === 0 ? (
               <div className="flex flex-col items-center px-3 py-10 text-center">
-                <div className="grid h-9 w-9 place-items-center rounded-xl border border-line/10 bg-panel text-muted/60">
+                <div className="grid h-9 w-9 place-items-center rounded-xl border border-line/10 bg-panel text-muted">
                   <Icon name="folderPlus" size={15} />
                 </div>
                 <p className="mt-3 text-[13.2px] font-medium text-ink">No notebooks yet</p>
@@ -3676,10 +4243,14 @@
                   const expanded = query ? true : !collapsedNotebooks.includes(group.id);
                   if (query && group.notes.length === 0) return null;
                   const isActiveNotebook = group.id === activeNotebookId;
+                  const hue = toneForId(group.id);
 
                   return (
                     <div key={group.id} className="mb-1.5">
-                      <div className="group/nb flex items-center gap-0.5 rounded-md pr-1 transition-colors hover:bg-line/[0.03]">
+                      <div className={cx(
+                        'group/nb flex items-center gap-0.5 rounded-md pr-1 transition-colors',
+                        isActiveNotebook ? hue.tint : 'hover:bg-line/[0.03]'
+                      )}>
                         <button
                           type="button"
                           onClick={() => onToggleNotebook(group.id)}
@@ -3690,15 +4261,24 @@
                           <Icon
                             name={expanded ? 'chevronDown' : 'chevronRight'}
                             size={11}
-                            className="shrink-0 text-muted/60"
+                            className={cx('shrink-0', expanded ? hue.text : 'text-muted')}
                           />
                           <span className={cx(
+                            'grid h-[15px] w-[15px] shrink-0 place-items-center rounded-[4px] border',
+                            expanded ? hue.chip : 'border-line/10 bg-line/[0.04] text-muted'
+                          )}>
+                            <Icon name="folder" size={9} />
+                          </span>
+                          <span className={cx(
                             'truncate text-[11.55px] font-semibold uppercase tracking-[0.12em]',
-                            isActiveNotebook ? 'text-ink' : 'text-muted/70'
+                            isActiveNotebook ? hue.text : 'text-muted'
                           )}>
                             {group.name}
                           </span>
-                          <span className="ml-0.5 shrink-0 text-[10.45px] tabular-nums text-muted/50">
+                          <span className={cx(
+                            'ml-0.5 shrink-0 rounded-full px-1 text-[10.45px] tabular-nums leading-[15px]',
+                            isActiveNotebook ? cx(hue.text, hue.tint) : 'text-muted'
+                          )}>
                             {group.notes.length}
                           </span>
                         </button>
@@ -3730,6 +4310,7 @@
                               <NoteListItem
                                 key={note.id}
                                 note={note}
+                                tone={hue}
                                 active={note.id === activeNoteId}
                                 onSelect={() => selectNote(note.id)}
                                 onDelete={onDelete}
@@ -3741,7 +4322,7 @@
                             <button
                               type="button"
                               onClick={() => onNew(group.id)}
-                              className="flex w-full items-center gap-1.5 rounded-md border border-dashed border-line/10 px-2 py-1.5 text-left text-[11px] text-muted/60 transition-colors hover:border-line/20 hover:text-muted"
+                              className="flex w-full items-center gap-1.5 rounded-md border border-dashed border-line/10 px-2 py-1.5 text-left text-[11px] text-muted transition-colors hover:border-line/20 hover:text-muted"
                             >
                               <Icon name="plus" size={10} /> Add a note
                             </button>
@@ -3756,8 +4337,10 @@
           </div>
 
           <div className="shrink-0 border-t border-line/8 px-4 py-2.5">
-            <div className="flex items-center gap-1.5 text-[11px] text-muted/70">
-              <Icon name="database" size={11} />
+            <div className="flex items-center gap-1.5 text-[11px] text-muted">
+              <span className="grid h-4 w-4 place-items-center rounded-full bg-c3/10 text-c3">
+                <Icon name="database" size={10} />
+              </span>
               <span>Autosaved on this device</span>
             </div>
           </div>
@@ -3808,10 +4391,10 @@
   function Logo({ className = '' }) {
     return (
       <div className={cx(
-        'grid h-7 w-7 shrink-0 place-items-center rounded-[9px] bg-ink text-panel shadow-sm',
+        'brand-mark grid h-7 w-7 shrink-0 place-items-center rounded-[9px]',
         className
       )}>
-        <Icon name="check" size={14} strokeWidth={2.4} />
+        <Icon name="check" size={14} strokeWidth={2.6} />
       </div>
     );
   }
@@ -3848,8 +4431,8 @@
     const [notebooks, setNotebooks] = useState([]);
     const [query, setQuery] = useState('');
     const [editorMode, setEditorMode] = useState(() => {
-      const stored = Prefs.get('editorMode', 'rich');
-      return ['rich', 'markdown', 'preview'].includes(stored) ? stored : 'rich';
+      const stored = Prefs.get('editorMode', 'edit');
+      return stored === 'display' || stored === 'preview' ? 'display' : 'edit';
     });
     const [hydrated, setHydrated] = useState(false);
     const [loadingError, setLoadingError] = useState(null);
@@ -3880,15 +4463,30 @@
     const persistedNotesRef = useRef(new Map());
     const dirtyNotesRef = useRef(new Map());
     const noteSaveTimerRef = useRef(null);
+    const imagePruneTimerRef = useRef(null);
     const searchRef = useRef(null);
     const titleInputRef = useRef(null);
     const taskInputRef = useRef(null);
     const taskFormRef = useRef(null);
     const swRegRef = useRef(null);
+    // Tracks whether a service-worker handoff already triggered a reload, so
+    // an update never reloads the page twice or loops.
+    const swUpdateRef = useRef({ reloading: false });
 
     const sync = useDiskSync({ notes, tasks, notebooks, enabled: hydrated, pushToast });
 
     /* ----------------------------- note persistence ----------------------- */
+
+    // Reclaims images no note references any more. The pass right after a save
+    // only starts the clock; a second pass (one TTL later) does the removal, so
+    // an undo or a second thought always finds the bytes still there. The
+    // delayed pass reads the live note list, never a stale snapshot.
+    const scheduleImagePrune = useCallback(() => {
+      const run = () => pruneAttachments(notesRef.current).catch(() => {});
+      run();
+      if (imagePruneTimerRef.current) clearTimeout(imagePruneTimerRef.current);
+      imagePruneTimerRef.current = setTimeout(run, ATTACHMENT_TTL_MS + 1500);
+    }, []);
 
     const flushNotes = useCallback(async () => {
       if (noteSaveTimerRef.current) {
@@ -3907,6 +4505,7 @@
         entries.forEach((note) => persistedNotesRef.current.set(note.id, note));
         setSavedAt(Date.now());
         setSaveState(dirtyNotesRef.current.size ? 'saving' : 'saved');
+        scheduleImagePrune();
       } catch (err) {
         entries.forEach((note) => {
           if (!dirtyNotesRef.current.has(note.id)) dirtyNotesRef.current.set(note.id, note);
@@ -3918,7 +4517,7 @@
           description: (err && err.message) || 'Storage may be full. Export a backup to keep your work safe.'
         });
       }
-    }, [pushToast]);
+    }, [pushToast, scheduleImagePrune]);
 
     useEffect(() => {
       if (!hydrated) return undefined;
@@ -3993,6 +4592,8 @@
             DB.getKV('notebooks', []),
             DB.getKV('seeded', false)
           ]);
+          // Images must be resolvable before the first note renders.
+          await loadAttachments();
 
           let nextNotes = (Array.isArray(storedNotes) ? storedNotes : []).map(normalizeNote).filter(Boolean);
           let nextTasks = (Array.isArray(storedTasks) ? storedTasks : []).map(normalizeTask).filter(Boolean);
@@ -4035,6 +4636,8 @@
           setActiveNoteId(preferredNote ? preferredNote.id : (sorted[0] ? sorted[0].id : null));
           setSavedAt(Date.now());
           setHydrated(true);
+          // Sweep images that were left unreferenced by a previous session.
+          scheduleImagePrune();
 
           if (DB.mode === 'local') {
             pushToast({
@@ -4051,7 +4654,12 @@
         }
       })();
       return () => { alive = false; };
-    }, [pushToast]);
+    }, [pushToast, scheduleImagePrune]);
+
+    // The delayed orphan sweep must not outlive the app.
+    useEffect(() => () => {
+      if (imagePruneTimerRef.current) clearTimeout(imagePruneTimerRef.current);
+    }, []);
 
     /* -------------------------------- theme ------------------------------- */
 
@@ -4130,7 +4738,7 @@
       setActiveNotebookId(notebookId);
       setCollapsedNotebooks((prev) => prev.filter((id) => id !== notebookId));
       setQuery('');
-      setEditorMode('rich');
+      setEditorMode('edit');
       setNewNoteSignal((value) => value + 1);
       if (isNarrow) setView('notes');
       else if (view === 'tasks') setView('split');
@@ -4150,6 +4758,9 @@
       DB.remove('notes', note.id).catch((err) => {
         pushToast({ tone: 'error', title: 'Could not delete note', description: (err && err.message) || 'Try again.' });
       });
+      // Detached images are reclaimed once they stay unreferenced long enough
+      // for the Undo action below to still be safe.
+      scheduleImagePrune();
 
       setActiveNoteId((current) => {
         if (current !== note.id) return current;
@@ -4174,7 +4785,7 @@
           }
         }
       });
-    }, [pushToast]);
+    }, [pushToast, scheduleImagePrune]);
 
     const pinNote = useCallback((note) => {
       updateNote(note.id, { pinned: !note.pinned });
@@ -4290,7 +4901,10 @@
 
     const copyNote = useCallback(async (note) => {
       try {
-        await navigator.clipboard.writeText(note.body || '');
+        // Embed screenshots as data URLs so the Markdown stands on its own
+        // wherever it is pasted.
+        const body = await embedAttachmentImages(note.body);
+        await navigator.clipboard.writeText(body);
         pushToast({ tone: 'success', title: 'Markdown copied', duration: 2200 });
       } catch (err) {
         pushToast({ tone: 'error', title: 'Could not access the clipboard', description: 'Your browser blocked clipboard access.' });
@@ -4298,7 +4912,8 @@
     }, [pushToast]);
 
     const exportNote = useCallback(async (note) => {
-      const content = noteToMarkdown(note, { frontmatter: false });
+      const embedded = await embedAttachmentImages(note.body);
+      const content = noteToMarkdown({ ...note, body: embedded }, { frontmatter: false });
       const filename = `${slugify(note.title) || 'note'}.md`;
       try {
         if (window.showSaveFilePicker) {
@@ -4410,7 +5025,7 @@
     const filteredNotes = useMemo(() => {
       const needle = query.trim().toLowerCase();
       if (!needle) return sortedNotes;
-      return sortedNotes.filter((note) => `${note.title}\n${note.body}`.toLowerCase().includes(needle));
+      return sortedNotes.filter((note) => searchableText(note).toLowerCase().includes(needle));
     }, [sortedNotes, query]);
 
     const notebookGroups = useMemo(() => notebooks.map((notebook) => ({
@@ -4531,6 +5146,13 @@
     }, [installPrompt, pushToast]);
 
     const exportBackup = useCallback(async () => {
+      let attachments = [];
+      try {
+        // Screenshots travel with the backup so a restore shows them again.
+        attachments = await exportAttachments(notes);
+      } catch (err) {
+        attachments = [];
+      }
       const payload = {
         app: 'Slate',
         schemaVersion: SCHEMA_VERSION,
@@ -4538,7 +5160,8 @@
         exportedAt: new Date().toISOString(),
         notes,
         tasks,
-        notebooks
+        notebooks,
+        attachments
       };
       const json = JSON.stringify(payload, null, 2);
       const filename = `slate-backup-${toDayKey()}.json`;
@@ -4596,6 +5219,11 @@
             await DB.clear('tasks');
             await DB.putMany('notes', nextNotes);
             await DB.putMany('tasks', nextTasks);
+            // Replace the image library wholesale: the restored notes reference
+            // this backup's attachment ids, not the old ones.
+            clearAttachmentCache();
+            await DB.clear('attachments');
+            const restoredImages = await restoreAttachments(data.attachments);
             await DB.setKV('notebooks', nextNotebooks);
             await DB.setKV('seeded', true);
             notesRef.current = nextNotes;
@@ -4611,7 +5239,7 @@
             setActiveNotebookId(nextNotebooks[0] ? nextNotebooks[0].id : null);
             setCollapsedNotebooks([]);
             setQuery('');
-            setEditorMode('rich');
+            setEditorMode('edit');
             setSavedAt(Date.now());
             pushToast({
               tone: 'success',
@@ -4630,13 +5258,14 @@
       setConfirmConfig({
         title: 'Clear all local data?',
         description: 'This cannot be undone.',
-        body: `This removes ${notesRef.current.length} notes, ${notebooksRef.current.length} notebooks, ${tasksRef.current.length} tasks, preferences, and the folder connection from this device. Files already written to a local folder are left untouched.`,
+        body: `This removes ${notesRef.current.length} notes, ${notebooksRef.current.length} notebooks, ${tasksRef.current.length} tasks, embedded images, preferences, and the folder connection from this device. Files already written to a local folder are left untouched.`,
         confirmLabel: 'Clear everything',
         danger: true,
         onConfirm: async () => {
           try {
             if (sync.connected) await sync.disconnect();
             await DB.clearAll();
+            clearAttachmentCache();
             const fresh = makeNotebook('Personal');
             await DB.setKV('notebooks', [fresh]);
             notesRef.current = [];
@@ -4651,7 +5280,7 @@
             setCollapsedNotebooks([]);
             setActiveNoteId(null);
             setQuery('');
-            setEditorMode('rich');
+            setEditorMode('edit');
             try { localStorage.removeItem(PREFS_KEY); } catch (err) { /* noop */ }
             setTheme('system');
             setView('split');
@@ -4686,6 +5315,14 @@
         window.removeEventListener('online', handleOnline);
         window.removeEventListener('offline', handleOffline);
       };
+    }, [pushToast]);
+
+    // Module-level helpers (image inserts, folder sync) raise toasts through
+    // this event so they never need a reference to the App component.
+    useEffect(() => {
+      const onToast = (event) => pushToast((event && event.detail) || {});
+      window.addEventListener('slate-toast', onToast);
+      return () => window.removeEventListener('slate-toast', onToast);
     }, [pushToast]);
 
     useEffect(() => {
@@ -4731,19 +5368,24 @@
       if (settingsOpen) refresh();
     }, [settingsOpen, notes.length, tasks.length]);
 
-    // Service worker: install once, offer a non-disruptive update path.
+    // Service worker: install once, then roll updates forward on its own.
     useEffect(() => {
       if (!('serviceWorker' in navigator)) return undefined;
       if (!/^https?:$/.test(window.location.protocol)) return undefined;
 
       let cancelled = false;
-      let refreshing = false;
+      let updateTimer = null;
       const hadController = Boolean(navigator.serviceWorker.controller);
 
       const onControllerChange = () => {
-        if (!hadController || refreshing) return;
-        refreshing = true;
-        window.location.reload();
+        // The new worker just took over. Persist anything still queued (notes
+        // autosave on a debounce), then load the fresh build. `hadController`
+        // keeps the very first install from triggering a pointless reload.
+        if (!hadController || swUpdateRef.current.reloading) return;
+        swUpdateRef.current.reloading = true;
+        Promise.resolve(flushNotes()).catch(() => {}).then(() => {
+          window.setTimeout(() => window.location.reload(), 120);
+        });
       };
       navigator.serviceWorker.addEventListener('controllerchange', onControllerChange);
 
@@ -4776,6 +5418,8 @@
           };
           document.addEventListener('visibilitychange', checkForUpdate);
           window.addEventListener('online', checkForUpdate);
+          // An installed window can stay open for days; do not wait for focus.
+          updateTimer = window.setInterval(checkForUpdate, 60 * 60 * 1000);
         } catch (err) {
           console.warn('[slate] Service worker registration failed:', err);
         }
@@ -4786,30 +5430,61 @@
 
       return () => {
         cancelled = true;
+        if (updateTimer) window.clearInterval(updateTimer);
         navigator.serviceWorker.removeEventListener('controllerchange', onControllerChange);
       };
     }, []);
 
+    // Announce a new build, then install it without asking. The toast stays up
+    // until the reload so the message is actually readable, and offers an
+    // immediate "Update now" for anyone who does not want to wait.
     useEffect(() => {
       if (!updateReady) return undefined;
+
+      let applied = false;
+      const apply = () => {
+        if (applied) return;
+        applied = true;
+        const registration = swRegRef.current;
+        const worker = registration && (registration.waiting || registration.installing);
+        if (worker) worker.postMessage({ type: 'SKIP_WAITING' });
+        else window.location.reload();
+      };
+
       const id = pushToast({
         tone: 'info',
-        title: 'A new version of Slate is ready',
-        description: 'Refresh when convenient to pick up the update.',
+        title: 'New version available',
+        description: `Slate v${APP_VERSION} is being updated automatically — it will reload in a moment.`,
         duration: 0,
         action: {
-          label: 'Refresh',
-          onClick: () => {
-            const registration = swRegRef.current;
-            if (registration && registration.waiting) {
-              registration.waiting.postMessage({ type: 'SKIP_WAITING' });
-            } else {
-              window.location.reload();
-            }
-          }
+          label: 'Update now',
+          onClick: apply
         }
       });
-      return () => dismissToast(id);
+
+      const applyTimer = window.setTimeout(apply, 2200);
+      // Safety net: if the worker never takes control, hand the reload back to
+      // the user instead of leaving a stuck toast behind.
+      const bailTimer = window.setTimeout(() => {
+        if (swUpdateRef.current.reloading) return;
+        dismissToast(id);
+        pushToast({
+          tone: 'info',
+          title: 'New version available',
+          description: 'The update did not apply by itself. Reload when you are ready.',
+          duration: 0,
+          action: {
+            label: 'Reload',
+            onClick: () => window.location.reload()
+          }
+        });
+      }, 15000);
+
+      return () => {
+        window.clearTimeout(applyTimer);
+        window.clearTimeout(bailTimer);
+        dismissToast(id);
+      };
     }, [updateReady, pushToast, dismissToast]);
 
     // Global shortcuts.
@@ -4855,7 +5530,7 @@
         if (mod && event.key.toLowerCase() === 'e') {
           if (!notesVisible) return;
           event.preventDefault();
-          setEditorMode((mode) => (mode === 'rich' ? 'markdown' : mode === 'markdown' ? 'preview' : 'rich'));
+          setEditorMode((mode) => (mode === 'display' ? 'edit' : 'display'));
           return;
         }
 
@@ -4950,23 +5625,30 @@
 
     return (
       <div className="flex h-full flex-col overflow-hidden bg-app">
-        <header className="relative z-20 flex h-14 shrink-0 items-center gap-2 border-b border-line/8 bg-panel/80 px-3 backdrop-blur-xl sm:px-4">
+        <header className="nav-topline relative z-20 flex h-14 shrink-0 items-center gap-2 border-b border-line/8 bg-panel/80 px-3 backdrop-blur-xl sm:px-4">
           <div className="flex min-w-0 items-center gap-2.5">
             <Logo />
             <div className="hidden leading-tight md:block">
-              <div className="text-[14.3px] font-semibold tracking-[-0.015em] text-ink">Slate</div>
+              <div className="brand-text text-[14.3px] font-semibold tracking-[-0.015em]">Slate</div>
               <div className="text-[9.9px] uppercase tracking-[0.18em] text-muted">Tasks &amp; Notes</div>
             </div>
+            <span
+              className="shrink-0 rounded-md border border-c1/25 bg-c1/10 px-1.5 py-0.5 text-[9.9px] font-semibold tabular-nums tracking-[0.04em] text-c1"
+              title={`Slate v${APP_VERSION} — this build. Updates install on their own: a toast appears, then the app reloads into the new version.`}
+            >
+              v{APP_VERSION}
+            </span>
           </div>
 
           <div className="flex min-w-0 flex-1 justify-center">
             <nav className="flex items-center gap-0.5 rounded-[10px] border border-line/8 bg-line/[0.025] p-0.5" aria-label="Switch view">
               {[
-                { value: 'tasks', label: 'Tasks', icon: 'listChecks', count: counts.active },
-                { value: 'notes', label: 'Notes', icon: 'notes', count: notes.length },
-                { value: 'split', label: 'Split', icon: 'layout' }
+                { value: 'tasks', label: 'Tasks', icon: 'listChecks', count: counts.active, hue: 'emerald' },
+                { value: 'notes', label: 'Notes', icon: 'notes', count: notes.length, hue: 'violet' },
+                { value: 'split', label: 'Split', icon: 'layout', hue: 'amber' }
               ].filter((option) => !isNarrow || option.value !== 'split').map((option) => {
                 const active = effectiveView === option.value;
+                const hue = tone(option.hue);
                 return (
                   <button
                     key={option.value}
@@ -4976,13 +5658,13 @@
                     title={option.label}
                     className={cx(
                       'inline-flex items-center gap-1.5 rounded-[7px] px-2 py-1.5 text-[12.65px] font-medium transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent/40',
-                      active ? 'bg-panel text-ink shadow-sm' : 'text-muted hover:text-ink'
+                      active ? hue.active : cx('text-muted hover:bg-line/[0.05] hover:text-ink')
                     )}
                   >
-                    <Icon name={option.icon} size={13} />
+                    <Icon name={option.icon} size={13} className={active ? '' : hue.text} />
                     <span className="hidden md:inline">{option.label}</span>
                     {option.count ? (
-                      <span className={cx('hidden text-[10.45px] tabular-nums sm:inline', active ? 'text-muted' : 'text-muted/70')}>
+                      <span className={cx('hidden text-[10.45px] tabular-nums sm:inline', active ? hue.text : 'text-muted')}>
                         {option.count}
                       </span>
                     ) : null}
@@ -5003,7 +5685,12 @@
               type="button"
               onClick={() => (sync.connected ? sync.syncNow() : setSettingsOpen(true))}
               title={sync.connected ? `Local folder: ${sync.folderName}` : 'Connect a local folder'}
-              className="hidden h-8 max-w-[150px] items-center gap-1.5 rounded-lg border border-line/8 bg-panel px-2 text-[11.55px] text-muted transition-colors hover:border-line/15 hover:text-ink sm:flex"
+              className={cx(
+                'hidden h-8 max-w-[150px] items-center gap-1.5 rounded-lg border px-2 text-[11.55px] transition-colors sm:flex',
+                sync.connected
+                  ? 'border-c3/25 bg-c3/[0.06] text-c3 hover:border-c3/40'
+                  : 'border-line/8 bg-panel text-muted hover:border-line/15 hover:text-ink'
+              )}
             >
               <span className={cx('h-1.5 w-1.5 shrink-0 rounded-full', syncState.dot)} />
               <span className="truncate">
@@ -5101,7 +5788,7 @@
               />
               {saveState === 'saving' ? 'Saving…' : saveState === 'error' ? 'Save failed' : 'Saved on device'}
             </span>
-            {savedAt ? <span className="hidden text-muted/60 md:inline">{formatRelative(savedAt)}</span> : null}
+            {savedAt ? <span className="hidden text-muted md:inline">{formatRelative(savedAt)}</span> : null}
           </div>
 
           <div className="flex min-w-0 items-center gap-3">
@@ -5114,7 +5801,7 @@
               >
                 <Icon name="folder" size={10} />
                 <span className="truncate">{sync.folderName}</span>
-                <span className="text-muted/50">·</span>
+                <span className="text-muted">·</span>
                 <span className={sync.status === 'error' ? 'text-rose-500' : ''}>
                   {sync.status === 'syncing' ? 'syncing…' : sync.status === 'synced' ? `synced ${syncHours}` : syncState.label.toLowerCase()}
                 </span>

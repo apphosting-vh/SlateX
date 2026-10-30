@@ -17,13 +17,29 @@ The first run creates **Personal** and **Reading** notebooks, each with a sample
 
 ## Writing notes
 
-The switch above a note offers three views:
+Notes have one editing surface with a single **Edit / Display** toggle above the note:
 
-- **Rich** — WYSIWYG editing. The toolbar covers bold, italic, strikethrough, inline code, headings, bulleted and numbered lists, checklists, quotes, code blocks, links, and dividers.
-- **Source** — the raw Markdown behind the note.
-- **Preview** — the rendered result.
+- **Edit** — WYSIWYG editing. The toolbar covers bold, italic, strikethrough, inline code, headings, bulleted and numbered lists, checklists, quotes, code blocks, links, images, and dividers.
+- **Display** — reads the note as rendered Markdown, with no toolbar or editing chrome.
 
-Formatting is always stored as Markdown, so search, exports, backups, and folder sync keep working unchanged. Checklist items are real checkboxes in the editor; ticking one writes `- [x]` back into the Markdown.
+Press `Ctrl+E` to flip between the two. Formatting is always stored as Markdown, so search, exports, backups, and folder sync keep working unchanged. Checklist items are real checkboxes in the editor; ticking one writes `- [x]` back into the Markdown.
+
+## Screenshots and images
+
+Images live *inside* the note, so they survive reloads, exports, and backups.
+
+- **Paste** a screenshot with `Ctrl+V` — clipboard images win over copied rich text.
+- **Drag and drop** a file onto the body; the caret lands where you dropped it.
+- Use the **image** button in the toolbar to pick one or more files.
+
+Each image is stored as bytes in the `attachments` store (IndexedDB) while the note body keeps plain Markdown: `![alt text](attachment://<id>)`. That keeps every existing Markdown path — search, preview, export, backup, folder sync — working unchanged.
+
+- **Search** matches the alt text, and the sidebar excerpt shows it instead of the raw syntax. Give screenshots useful descriptions (“invoice total”, “wiring diagram”).
+- **Backups** include the images, so **Export backup → Import backup** restores them.
+- **Copy note** and **Export → Markdown** embed the pictures as data URLs, making the file stand on its own.
+- **Folder sync** writes the pictures to `attachments/` and rewrites the links to relative paths, so the mirrored Markdown opens in any viewer.
+- Images no note references are cleaned up after they stay unused for a while — deleting one and pressing **Undo** in time still brings it back.
+- Only `https`, `data:image/*`, and Slate's own attachment links are ever rendered; anything else pasted in is dropped.
 
 ## Run it
 
@@ -63,9 +79,9 @@ Slate is a plain static site with no build step, and every path is relative, so 
 
 The included `.nojekyll` file tells GitHub Pages to serve the folder as-is. Service workers and the install prompt require HTTPS, which GitHub Pages provides. The manifest's `id`, `scope`, and `start_url` are relative, and the service worker resolves its shell against its own URL, so offline mode also works under the `/repo/` subpath.
 
-After pushing an update, reload so the service worker can fetch the new shell. The first reload may still show the cached build while the cache refreshes in the background; reload once more if needed. If the "update ready" toast appears, click reload.
+Updates are fully automatic. The current version is shown as a badge (for example `v1.7.0`) in the nav bar next to the Slate wordmark. When a new build is published, the open app checks for it on load, whenever the tab becomes visible, when the network returns, and once an hour. It then shows a **"New version available"** toast and installs the update a couple of seconds later — the app reloads itself into the new version, flushing any unsaved note edits first. Click **Update now** in the toast to skip the wait. Old caches are removed automatically.
 
-If you change any precached shell file, bump `CACHE_VERSION` in `sw.js` so returning visitors replace their old cache.
+If you change any precached shell file, bump `CACHE_VERSION` in `sw.js` **and** `APP_VERSION` in `app-core.js` (they must match) so returning visitors replace their old cache. The service worker warns in the console if the two disagree.
 
 ## Keyboard shortcuts
 
@@ -75,16 +91,16 @@ If you change any precached shell file, bump `CACHE_VERSION` in `sw.js` so retur
 | New task | `Ctrl+Enter` |
 | Search notes | `Ctrl+K` |
 | Save and sync | `Ctrl+S` |
-| Cycle editor view | `Ctrl+E` |
+| Switch edit / display | `Ctrl+E` |
 | Tasks / Notes / Split view | `Ctrl+1` / `Ctrl+2` / `Ctrl+3` |
 | Show shortcut list | `?` |
 | Close dialog | `Esc` |
 
 ## Where data lives
 
-- **IndexedDB** (`slate-db`) is the primary store for tasks, notes, and notebooks.
+- **IndexedDB** (`slate-db`) is the primary store for tasks, notes, notebooks, and image attachments (`notes`, `tasks`, `kv`, `attachments`).
 - **localStorage** keeps preferences only: theme, active view, filters, last opened note and notebook, collapsed notebooks, and editor view (`slate:prefs:v1`).
-- If IndexedDB cannot open, Slate falls back to a localStorage data mirror (`slate:data:v1:*`) so you can keep working; a toast warns you when that happens.
+- If IndexedDB cannot open, Slate falls back to a localStorage data mirror (`slate:data:v1:*`) so you can keep working; a toast warns you when that happens. Images fall back to data URLs in the same mirror.
 
 Older workspaces are migrated automatically: notes without a notebook are placed in a default **Personal** notebook.
 
@@ -95,12 +111,13 @@ Settings → **Connect folder** uses the File System Access API (Chromium only).
 - `tasks.json` — all tasks in one file
 - `notebooks.json` — every notebook
 - `notes/<slug>-<id>.md` — one Markdown file per note, with its notebook recorded in the frontmatter
+- `attachments/slate-<id>.png` — the images embedded in those notes, linked with relative paths
 
 Sync is one-way: **this device is the source of truth**. Files are rewritten on change (debounced) and stale note files created by Slate are removed. The folder handle is remembered across restarts; the browser may ask you to re-grant permission.
 
 ## Offline behavior
 
-A service worker pre-caches the app shell and CDN assets on first load. After that, Slate opens with no network at all and keeps working. The page itself must be loaded from the same origin it was installed from.
+A service worker pre-caches the app shell and CDN assets on first load. After that, Slate opens with no network at all and keeps working. The page itself must be loaded from the same origin it was installed from. Updates roll forward on their own: the app detects a new service worker, toasts **"New version available"**, and reloads into the new build within seconds (see the version badge in the nav bar for what is currently running).
 
 ## Files
 
@@ -121,4 +138,4 @@ A service worker pre-caches the app shell and CDN assets on first load. After th
 - **Install option missing** — the page must be on `localhost` or HTTPS. Refresh once so the service worker registers.
 - **Folder sync unavailable** — only Chromium-based browsers expose `showDirectoryPicker()`. Fall back to **Settings → Export backup**.
 - **Port already in use** — run `node serve.js 8080`.
-- **Stale UI after an update** — close all Slate windows and reopen; the worker's update prompt activates the new version and removes old caches.
+- **Stale UI after an update** — the nav-bar version badge shows what is running. Slate updates itself automatically (toast → a few seconds → reload), but if a tab was asleep, bring it to the foreground or reload once so it picks up the new build and drops the old caches.
